@@ -6,8 +6,7 @@ Alignment Search (DAS) to test whether sycophantic agreement is driven by a comp
 low-dimensional causal variable, and whether that compactness holds uniformly across
 network depth.
 
-See [`paper/paper_draft.md`](paper/paper_draft.md) for the full write-up (abstract,
-methods, results, discussion). The core finding: a 64-dimensional trained subspace
+The core finding: a 64-dimensional trained subspace
 matches or exceeds full-representation patching in mid-network blocks (12–21), but falls
 increasingly behind it at greater depth (blocks 22–31) — evidence that the causal
 geometry of the effect changes qualitatively with depth, not a single uniform mechanism.
@@ -28,7 +27,6 @@ controls/                 Copy-effect and irrelevant-answer controls testing whe
                           effect is separable from contextual entrainment, plus
                           per-example overlap/decomposition analyses.
 figures/                  Generated figures referenced in the paper.
-paper/                    The paper draft and a running results summary.
 ```
 
 Every script is a standalone, argparse-driven module — runnable with
@@ -85,8 +83,7 @@ for them.
 
 ## Known limitations
 
-See the Discussion section of the paper for the full account. In short: the copy-effect
-control does not converge across template wordings, so contextual entrainment and
+The copy-effect control does not converge across template wordings, so contextual entrainment and
 sycophantic agreement cannot be cleanly separated in this design; the late-layer
 DAS/patching gap is established only negatively (two candidate explanations were ruled
 out, not a mechanism confirmed); several training/evaluation choices (batch size 1, a
