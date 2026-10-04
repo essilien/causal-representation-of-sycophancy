@@ -1,0 +1,376 @@
+"""
+Aggregates v2 results into tables (CSV + LaTeX) and figures. CPU only, runs in seconds-
+minutes; fine on a login node.
+
+Uncertainty: every interval is a 95% percentile bootstrap that resamples test items within
+each seed and averages over seeds (seeds differ in split and DAS init, so seed variance is
+included through the average). DAS-vs-patch differences are paired on the same items.
+
+Usage:
+    python -m v2.analyze --model llama --results-root $SYCO_RESULTS            # everything
+    python -m v2.analyze --model llama --results-root $SYCO_RESULTS --only behavior main
+"""
+import argparse
+import json
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+
+from v2.config import CONDITIONS, MAIN_SOURCE, MENTION_TEMPLATES
+from v2.data import read_jsonl
+
+B = 2000
+RNG = np.random.default_rng(0)
+
+
+# ---- vectorized metrics over bootstrap rows [B, n] ----------------------------------------
+def v_iia(mi, ms, mn):
+    return np.mean((mi < 0) == (ms < 0), axis=-1)
+
+
+def v_bal(mi, ms, mn):
+    f, p = ms < 0, mi < 0
+    with np.errstate(invalid="ignore", divide="ignore"):
+        tpr = (p & f).sum(-1) / f.sum(-1)
+        tnr = (~p & ~f).sum(-1) / (~f).sum(-1)
+    return 0.5 * (tpr + tnr)
+
+
+def v_r(mi, ms, mn):
+    a = mi - mi.mean(-1, keepdims=True)
+    b = ms - ms.mean(-1, keepdims=True)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (a * b).sum(-1) / np.sqrt((a ** 2).sum(-1) * (b ** 2).sum(-1))
+
+
+def v_rec(mi, ms, mn):
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return (mi - mn).mean(-1) / (ms - mn).mean(-1)
+
+
+METRICS = {"iia": v_iia, "balanced_acc": v_bal, "pearson_r": v_r, "shift_recovered": v_rec}
+
+
+def boot(per_seed, fn, paired_with=None):
+    """per_seed: list of (m_int, m_src, m_neu) arrays (one tuple per seed). Returns
+    (point, lo, hi); if paired_with is given, statistics are of fn(a) - fn(b)."""
+    pts, bs = [], []
+    for s, tup in enumerate(per_seed):
+        n = len(tup[0])
+        idx = RNG.integers(0, n, (B, n))
+        val = fn(*[np.asarray(x)[None] for x in tup])[0]
+        bv = fn(*[np.asarray(x)[idx] for x in tup])
+        if paired_with is not None:
+            ot = paired_with[s]
+            val = val - fn(*[np.asarray(x)[None] for x in ot])[0]
+            bv = bv - fn(*[np.asarray(x)[idx] for x in ot])
+        pts.append(val)
+        bs.append(bv)
+    bs = np.nanmean(np.stack(bs), axis=0)
+    return float(np.mean(pts)), float(np.nanpercentile(bs, 2.5)), float(np.nanpercentile(bs, 97.5))
+
+
+def boot_mean(x):
+    x = np.asarray(x, dtype=float)
+    bm = x[RNG.integers(0, len(x), (B, len(x)))].mean(1)
+    return float(x.mean()), float(np.percentile(bm, 2.5)), float(np.percentile(bm, 97.5))
+
+
+def wilson(k, n):
+    if n == 0:
+        return (np.nan, np.nan, np.nan)
+    p, z = k / n, 1.96
+    c = (p + z * z / (2 * n)) / (1 + z * z / n)
+    h = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return p, c - h, c + h
+
+
+def fmt(t, pct=False):
+    s = 100 if pct else 1
+    return f"{t[0] * s:.1f} [{t[1] * s:.1f}, {t[2] * s:.1f}]" if pct else f"{t[0]:+.3f} [{t[1]:+.3f}, {t[2]:+.3f}]"
+
+
+def write_csv(path, rows):
+    if not rows:
+        return
+    keys = list(rows[0])
+    with open(path, "w") as f:
+        f.write(",".join(keys) + "\n")
+        for r in rows:
+            f.write(",".join(str(r[k]) for k in keys) + "\n")
+    print(f"  wrote {path}")
+
+
+# ---- behavior & entrainment ablation -------------------------------------------------------
+def analyze_behavior(root: Path, out: Path):
+    from scipy.stats import chi2_contingency
+    beh = root / "behavior"
+    meta = json.loads((beh / "meta.json").read_text())
+    items = read_jsonl(beh / "items.jsonl")
+    nc = [items[i] for i in meta["nc_ids"]]
+    lines = [f"# Behavior ({meta['hf_id']})",
+             f"Neutral-correct: {len(nc)}/{len(items)} ({len(nc) / len(items):.1%}); "
+             f"by dataset: " + ", ".join(
+                 f"{d} {sum(it['dataset'] == d for it in nc)}/{sum(it['dataset'] == d for it in items)}"
+                 for d in sorted({it['dataset'] for it in items})), ""]
+    rows = []
+    D = {c: np.array([it["margin"][c] - it["margin"]["neutral"] for it in nc]) for c in CONDITIONS}
+    for c in CONDITIONS:
+        if c == "neutral":
+            continue
+        k = sum(it["margin"][c] < 0 for it in nc)
+        dcp = [np.mean(it["lp"][c]["c_plus"]) - np.mean(it["lp"]["neutral"]["c_plus"]) for it in nc]
+        dcm = [np.mean(it["lp"][c]["c_minus"]) - np.mean(it["lp"]["neutral"]["c_minus"]) for it in nc]
+        rows.append({"condition": c, "flip_rate": fmt(wilson(k, len(nc)), True),
+                     "margin_shift": fmt(boot_mean(D[c])), "d_lp_correct": fmt(boot_mean(dcp)),
+                     "d_lp_incorrect": fmt(boot_mean(dcm))})
+    write_csv(out / "behavior_conditions.csv", rows)
+    lines += ["## Conditions (neutral-correct items; 95% CI)", ""] + [
+        f"- {r['condition']}: flip {r['flip_rate']}%, shift {r['margin_shift']}, "
+        f"dlp(c+) {r['d_lp_correct']}, dlp(c-) {r['d_lp_incorrect']}" for r in rows]
+
+    dec = []
+    for t in MENTION_TEMPLATES:
+        mp, mi = D[f"mention_plausible_{t}"], D[f"mention_irrelevant_{t}"]
+        parts = {"entrainment_of_c_minus": mp - mi,
+                 "generic_assertion_pressure": D["assert_irrelevant"] - mi,
+                 "content_specific_agreement": D["assert_plausible"] - D["assert_irrelevant"] - mp + mi,
+                 "total_assert_plausible": D["assert_plausible"]}
+        for name, v in parts.items():
+            dec.append({"mention_template": t, "component": name, "estimate": fmt(boot_mean(v))})
+    write_csv(out / "behavior_decomposition.csv", dec)
+    lines += ["", "## 2x2 decomposition of the margin shift (negative = toward c_minus)", ""] + [
+        f"- template {d['mention_template']} {d['component']}: {d['estimate']}" for d in dec]
+
+    # v1-style control: correct vs. the asserted irrelevant answer itself
+    both = [it for it in nc if it["margin"]["neutral__vs_r"] > 0]
+    f_syc = np.array([it["margin"]["assert_plausible"] < 0 for it in both])
+    f_ent = np.array([it["margin"]["assert_irrelevant__vs_r"] < 0 for it in both])
+    tab = np.array([[np.sum(f_syc & f_ent), np.sum(f_syc & ~f_ent)],
+                    [np.sum(~f_syc & f_ent), np.sum(~f_syc & ~f_ent)]])
+    chi2, p, _, _ = chi2_contingency(tab, correction=False)
+    phi = np.sqrt(chi2 / tab.sum())
+    jac = tab[0, 0] / max(1, tab[0, 0] + tab[0, 1] + tab[1, 0])
+    lines += ["", "## v1-style control (c_plus vs. asserted irrelevant r)", "",
+              f"- n = {len(both)} items correct under neutral for both pairs",
+              f"- flip rate plausible {f_syc.mean():.1%}, irrelevant (vs r) {f_ent.mean():.1%}",
+              f"- overlap Jaccard {jac:.1%}, chi2 p = {p:.3g}, phi = {phi:.3f}"]
+
+    # scoring-rule sensitivity
+    lines += ["", "## Scoring-rule sensitivity (assert_plausible)", ""]
+    base = np.array([it["margin"][MAIN_SOURCE] < 0 for it in nc])
+    for key, name in [("margin", "mean log-prob"), ("margin_sum", "sum log-prob"),
+                      ("margin_first", "first token")]:
+        nc_k = [it for it in items if it[key]["neutral"] > 0]
+        fr = np.mean([it[key][MAIN_SOURCE] < 0 for it in nc_k])
+        agree = np.mean([(it[key][MAIN_SOURCE] < 0) == b for it, b in zip(nc, base)])
+        lines.append(f"- {name}: neutral-correct {len(nc_k)}, flip rate {fr:.1%}, "
+                     f"label agreement with mean-log-prob on its items {agree:.1%}")
+    (out / "behavior.md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+
+
+# ---- interventions -------------------------------------------------------------------------
+def load_runs(root: Path, tag: str):
+    runs = defaultdict(dict)  # (method, k, source) -> {(seed, block): result}
+    for f in sorted((root / tag).glob("seed*/block*.json")):
+        r = json.loads(f.read_text())
+        key = ("patch", None, None) if r["method"] == "patch" else ("das", r["k"], r["source"])
+        runs[key][(r["seed"], r["block"])] = r
+    return runs
+
+
+def tuples(res_by_seed, src):
+    return [(np.array(r["eval"][src]["m_int"]), np.array(r["eval"][src]["m_src"]),
+             np.array(r["m_neutral"])) for r in res_by_seed]
+
+
+def analyze_main(root: Path, out: Path, k=64, src=MAIN_SOURCE):
+    runs = load_runs(root, "main")
+    das, patch = runs.get(("das", k, src), {}), runs.get(("patch", None, None), {})
+    blocks = sorted({b for _, b in das} & {b for _, b in patch})
+    if not blocks:
+        print("  main: no completed blocks yet")
+        return
+    rows = []
+    for b in blocks:
+        seeds = sorted({s for s, bb in das if bb == b} & {s for s, bb in patch if bb == b})
+        td = tuples([das[(s, b)] for s in seeds], src)
+        tp = tuples([patch[(s, b)] for s in seeds], src)
+        row = {"block": b, "n_seeds": len(seeds),
+               "n_test": len(td[0][0]),
+               "no_intervention_iia": float(np.mean([np.mean(t[1] >= 0) for t in td])),
+               "untrained_iia": float(np.mean([das[(s, b)]["untrained"]["iia"] for s in seeds]))}
+        for m, fn in METRICS.items():
+            for name, tt in [("das", td), ("patch", tp)]:
+                row[f"{name}_{m}"], row[f"{name}_{m}_lo"], row[f"{name}_{m}_hi"] = boot(tt, fn)
+            row[f"diff_{m}"], row[f"diff_{m}_lo"], row[f"diff_{m}_hi"] = boot(td, fn, paired_with=tp)
+        rows.append(row)
+    write_csv(out / f"main_k{k}.csv", rows)
+    _plot_main(rows, out / f"fig_main_k{k}.png")
+    _latex_main(rows, out / f"table_main_k{k}.tex")
+
+
+def _plot_main(rows, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    x = [r["block"] for r in rows]
+    fig, axes = plt.subplots(1, 3, figsize=(13, 3.6))
+    for ax, m, lab in zip(axes, ["iia", "balanced_acc", "pearson_r"], ["IIA", "Balanced accuracy", "Pearson r"]):
+        for name, col, mk in [("patch", "tab:blue", "o"), ("das", "tab:red", "s")]:
+            y = [r[f"{name}_{m}"] for r in rows]
+            ax.plot(x, y, color=col, marker=mk, ms=3, label={"patch": "Full patching", "das": "DAS (k=64)"}[name])
+            ax.fill_between(x, [r[f"{name}_{m}_lo"] for r in rows], [r[f"{name}_{m}_hi"] for r in rows],
+                            color=col, alpha=0.15, lw=0)
+        if m == "iia":
+            ax.plot(x, [r["no_intervention_iia"] for r in rows], "k--", lw=1, label="No intervention")
+            ax.plot(x, [1 - r["no_intervention_iia"] for r in rows], ":", color="gray", lw=1, label="Always flip")
+        if m == "balanced_acc":
+            ax.axhline(0.5, color="k", ls="--", lw=1)
+        ax.set_xlabel("Decoder block")
+        ax.set_title(lab)
+        ax.grid(alpha=0.3)
+    axes[0].legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
+def _latex_main(rows, path):
+    lines = [r"\begin{tabular}{rcccc}", r"\toprule",
+             r"Block & DAS IIA & Patch IIA & $\Delta$ IIA (P$-$D) & DAS / Patch $r$ \\", r"\midrule"]
+    for r in rows:
+        lines.append(f"{r['block']} & {100 * r['das_iia']:.1f} & {100 * r['patch_iia']:.1f} & "
+                     f"${-100 * r['diff_iia']:+.1f}$ [{-100 * r['diff_iia_hi']:+.1f}, {-100 * r['diff_iia_lo']:+.1f}] & "
+                     f"{r['das_pearson_r']:.2f} / {r['patch_pearson_r']:.2f} \\\\")
+    lines += [r"\bottomrule", r"\end{tabular}"]
+    path.write_text("\n".join(lines) + "\n")
+    print(f"  wrote {path}")
+
+
+def analyze_rank(root: Path, out: Path, src=MAIN_SOURCE):
+    runs = load_runs(root, "rank")
+    patch = load_runs(root, "main").get(("patch", None, None), {})
+    rows = []
+    for (method, k, s), res in sorted(runs.items(), key=lambda kv: (kv[0][0], kv[0][1] or 0)):
+        if method != "das" or s != src:
+            continue
+        for b in sorted({bb for _, bb in res}):
+            seeds = sorted(ss for ss, bb in res if bb == b)
+            t = tuples([res[(ss, b)] for ss in seeds], src)
+            row = {"block": b, "k": k, "n_seeds": len(seeds)}
+            for m in ["iia", "pearson_r", "shift_recovered"]:
+                row[m], row[m + "_lo"], row[m + "_hi"] = boot(t, METRICS[m])
+            ps = [ss for ss in seeds if (ss, b) in patch]
+            if ps:
+                row["patch_pearson_r"] = boot(tuples([patch[(ss, b)] for ss in ps], src), v_r)[0]
+            rows.append(row)
+    if not rows:
+        print("  rank: no results yet")
+        return
+    write_csv(out / "rank.csv", rows)
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(5, 3.6))
+    for b in sorted({r["block"] for r in rows}):
+        rr = sorted((r for r in rows if r["block"] == b), key=lambda r: r["k"])
+        line, = ax.plot([r["k"] for r in rr], [r["pearson_r"] for r in rr], marker="o", ms=3, label=f"block {b}")
+        if "patch_pearson_r" in rr[0]:
+            ax.axhline(rr[0]["patch_pearson_r"], color=line.get_color(), ls=":", lw=1)
+    ax.set_xscale("log", base=2)
+    ax.set_xlabel("DAS rank k (dotted: full patching)")
+    ax.set_ylabel("Pearson r")
+    ax.legend(fontsize=7)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out / "fig_rank.png", dpi=200)
+    plt.close(fig)
+
+
+def analyze_transfer(root: Path, out: Path, k=64):
+    """Train-source x eval-source matrix per block (shift recovered, r), and subspace overlap
+    between DAS solutions trained on different sources: mean cos^2 of principal angles
+    = ||W1^T W2||_F^2 / k (random subspaces: k/d)."""
+    import torch
+    runs = {}
+    for tag in ["main", "ablation"]:
+        for key, res in load_runs(root, tag).items():
+            if key[0] == "das" and key[1] == k:
+                runs.setdefault(key[2], {}).update(res)
+    if len(runs) < 2:
+        print("  transfer: need main + ablation results")
+        return
+    rows, ov = [], []
+    srcs = sorted(runs)
+    blocks = sorted({b for res in runs.values() for _, b in res})
+    for b in blocks:
+        for tr in srcs:
+            seeds = sorted(s for s, bb in runs[tr] if bb == b)
+            if not seeds:
+                continue
+            for ev in runs[tr][(seeds[0], b)]["eval"]:
+                t = tuples([runs[tr][(s, b)] for s in seeds], ev)
+                rows.append({"block": b, "train_source": tr, "eval_source": ev, "n_seeds": len(seeds),
+                             "shift_recovered": boot(t, v_rec)[0], "pearson_r": boot(t, v_r)[0]})
+        for i, a in enumerate(srcs):
+            for c in srcs[i + 1:]:
+                vals = []
+                for s in sorted({s for s, bb in runs[a] if bb == b} & {s for s, bb in runs[c] if bb == b}):
+                    fa = root / ("main" if a == MAIN_SOURCE else "ablation") / f"seed{s}" / f"block{b:02d}__das__k{k}__src-{a}.W.pt"
+                    fc = root / ("main" if c == MAIN_SOURCE else "ablation") / f"seed{s}" / f"block{b:02d}__das__k{k}__src-{c}.W.pt"
+                    if fa.exists() and fc.exists():
+                        Wa, Wc = torch.load(fa).float(), torch.load(fc).float()
+                        vals.append(float((Wa.T @ Wc).pow(2).sum() / k))
+                if vals:
+                    ov.append({"block": b, "source_a": a, "source_b": c, "overlap": float(np.mean(vals)),
+                               "random_baseline": k / Wa.shape[0], "n_seeds": len(vals)})
+    write_csv(out / f"transfer_k{k}.csv", rows)
+    write_csv(out / f"subspace_overlap_k{k}.csv", ov)
+
+
+def analyze_probe(root: Path, out: Path):
+    f = root / "probe.json"
+    if not f.exists():
+        print("  probe: no probe.json yet")
+        return
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    data = json.loads(f.read_text())
+    fig, ax = plt.subplots(figsize=(5, 3.4))
+    for cond, rows in data.items():
+        x = [r["block"] for r in rows]
+        line, = ax.plot(x, [r["r2"] for r in rows], marker="o", ms=2.5, label=cond)
+        ax.plot(x, [r["null_95"] for r in rows], ls=":", color=line.get_color(), lw=1)
+    ax.axhline(0, color="k", lw=0.8)
+    ax.set_xlabel("Decoder block")
+    ax.set_ylabel("Out-of-fold $R^2$ (dotted: null 95th pct.)")
+    ax.legend(fontsize=7)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out / "fig_probe.png", dpi=200)
+    plt.close(fig)
+    print(f"  wrote {out / 'fig_probe.png'}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--model", default="llama")
+    ap.add_argument("--results-root", required=True)
+    ap.add_argument("--only", nargs="+", default=["behavior", "probe", "main", "rank", "transfer"])
+    args = ap.parse_args()
+    root = Path(args.results_root) / args.model
+    out = root / "analysis"
+    out.mkdir(exist_ok=True)
+    for part in args.only:
+        print(f"== {part} ==")
+        {"behavior": analyze_behavior, "probe": analyze_probe, "main": analyze_main,
+         "rank": analyze_rank, "transfer": analyze_transfer}[part](root, out)
+
+
+if __name__ == "__main__":
+    main()
