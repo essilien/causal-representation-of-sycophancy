@@ -5,12 +5,12 @@ v1 code (`common/`, `phase*/`, `controls/`) is untouched and not imported.
 
 | ID | Question | Where |
 |----|----------|-------|
-| E1 | More statistical power | All 1813 deduplicated questions (996 TriviaQA, 817 TruthfulQA) instead of 1000 sampled; 70/10/20 train/val/test split, giving about 3x more test items. |
-| E2 | Is the mid-network "DAS ≥ patching" real? | 3 seeds (each seed sets both the data split and the DAS init), all 32 blocks. Reports bootstrap 95% CIs, paired DAS−patch differences, IIA, balanced accuracy, Pearson r, and the fraction of the shift recovered. |
-| E3 | Is the late-layer gap a rank or optimization artifact? | Rank sweep k ∈ {1, 4, 16, 64, 256, 1024} at 8 blocks with 3 seeds. LR is calibrated on val. Checkpoints are selected by val loss. |
+| E1 | More statistical power | All 1813 deduplicated questions (996 TriviaQA, 817 TruthfulQA) instead of 1000 sampled; 70/10/20 train/val/test split. Assuming ~60% neutral-correct, the test split grows from 121 to ~218 items per seed (about 1.8x; the binomial SE of IIA drops from ~4.5 to ~3.4 points). |
+| E2 | Is the mid-network "DAS ≥ patching" real? | 3 seeds (each seed sets both the data split and the DAS init), all 32 blocks. Reports IIA, balanced accuracy, Pearson r and the fraction of the shift recovered, each with a 95% item-bootstrap CI plus the across-seed SD (init/split variability is not inside the CI), and paired DAS−patch differences. |
+| E3 | Is the late-layer gap a rank or optimization artifact? | Rank sweep k ∈ {1, 4, 16, 64, 256, 1024} at 8 blocks with 3 seeds. LR is calibrated on val separately for k = 1, 64 and 1024. Checkpoints are selected by val loss. |
 | E4 | Sycophancy vs. contextual entrainment | 2×2 behavioral design (framing × content, 3 mention wordings). DAS is also trained on the entrainment-only and assertion-only sources. Outputs a transfer matrix and the subspace overlap. |
 | E5 | Generalization | Same pipeline with `MODEL=qwen` (Qwen2.5-7B-Instruct). |
-| (limitation 1) | Is late-layer patching just "copying the output"? | Every intervention also logs the first-answer-token margin separately. |
+| (limitation 1) | Is late-layer patching just "copying the output"? | Every intervention logs the margin on the first answer token and on tokens 2..k separately; `analyze` reports the shift recovered on each (`fig_first_vs_rest_k64.png`). If the late-layer patching advantage vanishes on tokens 2..k, it is carried by the token read directly off the patched position. |
 
 ## Changes from v1
 

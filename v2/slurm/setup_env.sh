@@ -12,6 +12,7 @@ WS=$(ws_find syco 2>/dev/null || true)
 if [ -z "$WS" ]; then
     WS=$(ws_allocate syco 60)
 fi
+chmod 700 "$WS"   # the HF token will be stored under $WS/hf
 echo "Workspace: $WS"
 
 if ! command -v uv >/dev/null 2>&1; then

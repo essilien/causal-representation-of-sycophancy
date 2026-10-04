@@ -25,7 +25,7 @@ import numpy as np
 import torch
 
 from v2.config import CONDITIONS, MODELS, build_prompt, candidates_for
-from v2.data import load_items, write_jsonl
+from v2.data import items_fingerprint, load_items, read_jsonl, rest_margin, write_json, write_jsonl
 from v2.lm import LM, Seq
 
 
@@ -48,11 +48,12 @@ def score_all(lm: LM, items, bs: int, log=print):
         if (s // bs) % 100 == 0:
             log(f"  {s}/{len(jobs)} ({time.time() - t0:.0f}s)")
     for it in items:
-        it["margin"], it["margin_first"], it["margin_sum"] = {}, {}, {}
+        it["margin"], it["margin_first"], it["margin_rest"], it["margin_sum"] = {}, {}, {}, {}
         for cond, lp in it["lp"].items():
             cp, cm = lp["c_plus"], lp["c_minus"]
             it["margin"][cond] = float(np.mean(cp) - np.mean(cm))
             it["margin_first"][cond] = cp[0] - cm[0]
+            it["margin_rest"][cond] = rest_margin(cp, cm)
             it["margin_sum"][cond] = float(np.sum(cp) - np.sum(cm))
             if "r" in lp:  # v1-style control: correct answer vs. the asserted irrelevant answer
                 it["margin"][cond + "__vs_r"] = float(np.mean(cp) - np.mean(lp["r"]))
@@ -94,10 +95,14 @@ def main():
     lm = LM.load(MODELS[args.model])
     print(f"Loaded {MODELS[args.model]}: {lm.n_layers} blocks, d={lm.d_model}")
 
+    fp = items_fingerprint(items)
     if (out / "items.jsonl").exists() and (out / "meta.json").exists():
-        from v2.data import read_jsonl
+        old = json.loads((out / "meta.json").read_text())
+        if old.get("fingerprint") != fp or old.get("hf_id") != MODELS[args.model]:
+            raise RuntimeError(f"{out} holds results for a different question set or model "
+                               "(other --limit/--dataset-path?). Use a fresh --results-root.")
         items = read_jsonl(out / "items.jsonl")
-        print("items.jsonl exists, reusing scores")
+        print("items.jsonl exists for the same questions, reusing scores")
     else:
         score_all(lm, items, args.bs)
     nc_ids = [it["id"] for it in items if it["margin"]["neutral"] > 0]
@@ -106,8 +111,8 @@ def main():
     write_jsonl(out / "items.jsonl", items)
     meta = {"model": args.model, "hf_id": MODELS[args.model], "n_layers": lm.n_layers,
             "d_model": lm.d_model, "n_items": len(items), "nc_ids": nc_ids,
-            "conditions": list(CONDITIONS)}
-    (out / "meta.json").write_text(json.dumps(meta))
+            "conditions": list(CONDITIONS), "fingerprint": fp}
+    write_json(out / "meta.json", meta)
 
     print(f"\nNeutral-correct: {len(nc_ids)}/{len(items)} = {len(nc_ids) / len(items):.1%}")
     for cond in CONDITIONS:

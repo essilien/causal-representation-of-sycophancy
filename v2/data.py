@@ -2,7 +2,9 @@
 Dataset loading (all deduplicated questions of SycophancyEval's `answer` split: 1813, of
 which 996 TriviaQA and 817 TruthfulQA), irrelevant-answer pairing, and per-seed splits.
 """
+import hashlib
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -78,3 +80,23 @@ def write_jsonl(path: str | Path, rows: list[dict]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+
+def write_json(path: str | Path, obj) -> None:
+    """Atomic write (tmp file + rename): concurrent array tasks and timeouts never leave a
+    half-written file that a later run would mistake for a finished result."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(obj))
+    os.replace(tmp, path)
+
+
+def rest_margin(lp_plus: list[float], lp_minus: list[float]) -> float:
+    """Mean log-prob margin over answer tokens 2..k (NaN if either answer is one token)."""
+    if len(lp_plus) < 2 or len(lp_minus) < 2:
+        return float("nan")
+    return float(np.mean(lp_plus[1:]) - np.mean(lp_minus[1:]))
+
+
+def items_fingerprint(items: list[dict]) -> str:
+    return hashlib.sha256("\n".join(it["question"] for it in items).encode()).hexdigest()[:16]

@@ -94,11 +94,26 @@ def test_units():
     # DAS training runs and does not get worse on val than its init
     items = [BaseItem(s.prefix, s.cand, list(rng.integers(3, VOCAB, 2))) for s in seqs * 4]
     cache = np.random.default_rng(1).standard_normal((len(items), lm.n_layers, lm.d_model)).astype(np.float16)
-    with torch.no_grad():
-        tgt, _ = evaluate(lm, items, np.arange(len(items)), 2, cache)  # full-patch margins as targets
-    W, hist = train_das(lm, items, np.arange(16), np.arange(16, 24), 2, cache, tgt, k=8, seed=0,
+    src2 = cache[:, 2].astype(np.float32)
+    tgt = evaluate(lm, items, np.arange(len(items)), 2, src2)  # full-patch margins as targets
+    assert set(tgt) == {"mean", "first", "rest"}
+    m = tgt["mean"]
+    W, hist = train_das(lm, items, np.arange(16), np.arange(16, 24), 2, src2, m, k=8, seed=0,
                         steps=40, bs=4, lr=5e-2, eval_every=10, log=lambda *a: None)
     assert hist["best_val_mse"] <= hist["val"][0][1] + 1e-9
+
+    # first/rest decomposition: single-token answers give NaN rest; multi-token ones match
+    with torch.no_grad():
+        mm, mf, mr = margins(lm, items[:6], range(6))
+        lps = lm.token_logprobs([Seq(items[0].prefix, items[0].c_plus), Seq(items[0].prefix, items[0].c_minus)])
+    if len(items[0].c_plus) > 1 and len(items[0].c_minus) > 1:
+        assert abs(mr[0].item() - (lps[0][1:].mean() - lps[1][1:].mean()).item()) < 1e-5
+    assert abs(mf[0].item() - (lps[0][0] - lps[1][0]).item()) < 1e-5
+
+    from v2.data import write_json
+    with tempfile.TemporaryDirectory() as d:
+        write_json(Path(d) / "x.json", {"a": 1})
+        assert [p.name for p in Path(d).iterdir()] == ["x.json"]  # no tmp file left behind
 
     from v2.run_probe import oof_r2
     X = rng.standard_normal((200, 50))
@@ -129,7 +144,7 @@ def test_integration(dataset_path):
         assert n_nc >= 10, f"too few neutral-correct items for the test ({n_nc})"
         run(run_probe, "--n-perm", "5")
         run(run_intervention, "--tag", "calibrate", "--blocks", "1", "--calibrate-lrs", "1e-2", "5e-2",
-            "--steps", "10", "--bs", "4", "--eval-every", "5", "--ranks", "4")
+            "--steps", "10", "--bs", "4", "--eval-every", "5", "--ranks", "4", "16")
         run(run_intervention, "--tag", "main", "--seeds", "0", "1", "--blocks", "all", "--chunk", "0/2",
             "--ranks", "4", "--steps", "10", "--bs", "4", "--eval-every", "5")
         run(run_intervention, "--tag", "main", "--seeds", "0", "1", "--blocks", "all", "--chunk", "1/2",
@@ -150,7 +165,20 @@ def test_integration(dataset_path):
         analyze.analyze_rank(root, root / "analysis")
         produced = sorted(p.name for p in (root / "analysis").iterdir())
         print("analysis outputs:", produced)
-        for f in ["behavior.md", "main_k4.csv", "fig_main_k4.png", "rank.csv", "transfer_k4.csv",
+        import csv
+        row = next(csv.DictReader(open(root / "analysis" / "main_k4.csv")))
+        for col in ["das_iia_seed_sd", "diff_iia_seed_sd", "das_shift_recovered_first",
+                    "patch_shift_recovered_rest", "n_test_rest"]:
+            assert col in row, f"missing column {col}"
+        assert (root / "calibrate" / "best_lr_k4.json").exists() and (root / "calibrate" / "best_lr_k16.json").exists()
+        # resuming with a different question set must refuse instead of mixing results
+        try:
+            run(run_behavior, "--limit", "50", "--bs", "16")
+            raise AssertionError("resume with a different --limit should fail")
+        except RuntimeError:
+            pass
+        for f in ["behavior.md", "main_k4.csv", "fig_main_k4.png", "fig_first_vs_rest_k4.png",
+                  "rank.csv", "transfer_k4.csv",
                   "subspace_overlap_k4.csv", "fig_probe.png", "table_main_k4.tex"]:
             assert f in produced, f"missing {f}"
     print("integration test passed")

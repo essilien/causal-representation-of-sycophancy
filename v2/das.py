@@ -38,9 +38,11 @@ class Subspace(torch.nn.Module):
 
 def margins(lm: LM, items: list[BaseItem], idx, layer: int | None = None,
             src: torch.Tensor | None = None, W: torch.Tensor | None = None):
-    """Returns (mean-token margin, first-token margin) tensors for items[idx]. With src=None
-    no intervention is applied. The first-token margin is logged separately because near
-    the output the patched last-prompt vector directly produces the first answer token."""
+    """Margins for items[idx] as (mean-token, first-token, rest) tensors. With src=None no
+    intervention is applied. First token and the remaining tokens are split out because
+    near the output the patched last-prompt vector directly produces the FIRST answer
+    token; `rest` (mean over tokens 2..k, NaN if either candidate is a single token) is
+    the part of the margin that is not read off the patched position itself."""
     seqs, pos = [], []
     for i in idx:
         it = items[i]
@@ -53,30 +55,33 @@ def margins(lm: LM, items: list[BaseItem], idx, layer: int | None = None,
     lps = lm.token_logprobs(seqs, layer, fn)
     mean = torch.stack([lp.mean() for lp in lps])
     first = torch.stack([lp[0] for lp in lps])
-    return mean[0::2] - mean[1::2], first[0::2] - first[1::2]
+    nan = mean.new_tensor(float("nan"))
+    rest = torch.stack([lp[1:].mean() if len(lp) > 1 else nan for lp in lps])
+    return mean[0::2] - mean[1::2], first[0::2] - first[1::2], rest[0::2] - rest[1::2]
 
 
-def _src(cache, idx, layer, device):
-    return torch.from_numpy(np.asarray(cache[np.asarray(idx), layer], dtype=np.float32)).to(device)
+def _src(src_layer: np.ndarray, idx, device):
+    """src_layer: one block's source vectors for all items, [n_items, d] (preloaded)."""
+    return torch.from_numpy(np.ascontiguousarray(src_layer[np.asarray(idx)], dtype=np.float32)).to(device)
 
 
 @torch.no_grad()
-def evaluate(lm, items, idx, layer, cache=None, W=None, bs=32):
-    """Margins under intervention for every index in idx (cache=None: no intervention)."""
-    m, mf = [], []
+def evaluate(lm, items, idx, layer, src_layer=None, W=None, bs=32) -> dict:
+    """Margins under intervention for every index in idx (src_layer=None: no intervention).
+    Returns {"mean", "first", "rest"} numpy arrays."""
+    out = {"mean": [], "first": [], "rest": []}
     for s in range(0, len(idx), bs):
         chunk = idx[s:s + bs]
-        src = _src(cache, chunk, layer, lm.device) if cache is not None else None
-        a, b = margins(lm, items, chunk, layer, src, W)
-        m.append(a.cpu())
-        mf.append(b.cpu())
-    return torch.cat(m).numpy(), torch.cat(mf).numpy()
+        src = _src(src_layer, chunk, lm.device) if src_layer is not None else None
+        for key, v in zip(out, margins(lm, items, chunk, layer, src, W)):
+            out[key].append(v.cpu())
+    return {k: torch.cat(v).numpy() for k, v in out.items()}
 
 
-def train_das(lm, items, train_idx, val_idx, layer, cache, targets, k, seed,
+def train_das(lm, items, train_idx, val_idx, layer, src_layer, targets, k, seed,
               steps=600, bs=16, lr=2e-3, eval_every=50, log=print):
-    """Trains W on train_idx; returns (best W by validation MSE, history). targets: array of
-    real source-run margins aligned with items/cache rows."""
+    """Trains W on train_idx; returns (best W by validation MSE, history). src_layer: this
+    block's source vectors [n_items, d]; targets: real source-run margins [n_items]."""
     torch.manual_seed(seed)
     sub = Subspace(lm.d_model, k, seed).to(lm.device)
     opt = torch.optim.Adam(sub.parameters(), lr=lr)
@@ -85,7 +90,7 @@ def train_das(lm, items, train_idx, val_idx, layer, cache, targets, k, seed,
     tgt_val = targets[val_idx]
 
     def val_mse():
-        m, _ = evaluate(lm, items, val_idx, layer, cache, sub().detach())
+        m = evaluate(lm, items, val_idx, layer, src_layer, sub().detach())["mean"]
         return float(np.mean((m - tgt_val) ** 2))
 
     best = {"step": 0, "val_mse": val_mse(), "A": sub.A.detach().clone()}
@@ -96,8 +101,7 @@ def train_das(lm, items, train_idx, val_idx, layer, cache, targets, k, seed,
             order, ptr = rng.permutation(train_idx), 0
         batch = order[ptr:ptr + bs]
         ptr += bs
-        src = _src(cache, batch, layer, lm.device)
-        m, _ = margins(lm, items, batch, layer, src, sub())
+        m = margins(lm, items, batch, layer, _src(src_layer, batch, lm.device), sub())[0]
         loss = ((m - torch.tensor(targets[batch], device=m.device, dtype=m.dtype)) ** 2).mean()
         opt.zero_grad(set_to_none=True)
         loss.backward()

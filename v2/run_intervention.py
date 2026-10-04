@@ -18,7 +18,7 @@ Usage examples:
   python -m v2.run_intervention --results-root R --tag rank --seeds 0 --blocks 5,13,21,29 \
       --methods das --ranks 1 4 16 64 256 1024
   python -m v2.run_intervention --results-root R --tag calibrate --calibrate-lrs 5e-4 2e-3 8e-3 \
-      --blocks 13,25 --seeds 0
+      --blocks 13,25 --seeds 0 --ranks 64 1 1024      # one best LR per rank
 """
 import argparse
 import json
@@ -29,9 +29,15 @@ import numpy as np
 import torch
 
 from v2.config import EVAL_SOURCES, MAIN_SOURCE, MODELS, build_prompt
-from v2.das import BaseItem, evaluate, metrics, train_das
-from v2.data import read_jsonl, split
+from v2.das import BaseItem, Subspace, evaluate, metrics, train_das
+from v2.data import read_jsonl, rest_margin, split, write_json
 from v2.lm import LM
+
+# Unintervened margins are recomputed here with a different batch composition than in
+# run_behavior, so bf16 reduction order differs. Small differences are expected noise;
+# only abort if they are large enough to signal a real pipeline mismatch.
+SANITY_MAX_ABS = 0.5
+SANITY_MAX_SIGN_DISAGREE = 0.02
 
 
 def parse_blocks(spec: str, n_layers: int) -> list[int]:
@@ -65,11 +71,12 @@ def main():
     ap.add_argument("--eval-sources", nargs="+", default=EVAL_SOURCES)
     ap.add_argument("--steps", type=int, default=600)
     ap.add_argument("--bs", type=int, default=16)
-    ap.add_argument("--lr", default="auto", help='float, or "auto" = <model>/calibrate/best_lr.json (else 2e-3)')
+    ap.add_argument("--lr", default="auto",
+                    help='float, or "auto" = calibrate/best_lr_k<k>.json, else calibrate/best_lr.json, else 2e-3')
     ap.add_argument("--eval-every", type=int, default=50)
     ap.add_argument("--calibrate-lrs", type=float, nargs="+", default=None,
-                    help="calibration mode: train with each LR, report val MSE only (test untouched)")
-    ap.add_argument("--save-w", action="store_true", default=True)
+                    help="calibration mode: train with each LR (and each --ranks), val MSE only (test untouched)")
+    ap.add_argument("--no-save-w", dest="save_w", action="store_false", help="don't save trained W tensors")
     args = ap.parse_args()
 
     root = Path(args.results_root) / args.model
@@ -79,8 +86,8 @@ def main():
     nc = [items[i] for i in meta["nc_ids"]]
     caches = {c: np.load(beh / "cache" / f"{c}.npy", mmap_mode="r")
               for c in set(args.eval_sources) | {args.source}}
-    m_neu = np.array([it["margin"]["neutral"] for it in nc])
-    tgt = {c: np.array([it["margin"][c] for it in nc]) for c in caches}
+    neu = per_token_margins(nc, "neutral")
+    tgt = {c: per_token_margins(nc, c) for c in caches}
 
     lm = LM.load(MODELS[args.model])
     base = [BaseItem(lm.encode_prompt(build_prompt("neutral", it)),
@@ -93,100 +100,126 @@ def main():
     if args.calibrate_lrs:
         return calibrate(args, lm, base, caches, tgt, blocks, out_dir)
 
-    lr = resolve_lr(args.lr, root)
-    print(f"LR = {lr}")
     for seed in args.seeds:
         sp = split(len(nc), seed)
         sd = out_dir / f"seed{seed}"
         sd.mkdir(exist_ok=True)
-        (sd / "split.json").write_text(json.dumps({k: v.tolist() for k, v in sp.items()}))
+        write_json(sd / "split.json", {k: v.tolist() for k, v in sp.items()})
         test = sp["test"]
-
-        # Sanity check once per seed: the unintervened batched pipeline must reproduce the
-        # behavior-stage neutral margins (differences only from bf16 / batching noise).
-        chk = sd / "sanity.json"
-        if not chk.exists():
-            m0, _ = evaluate(lm, base, test, None)
-            diff = float(np.max(np.abs(m0 - m_neu[test])))
-            chk.write_text(json.dumps({"max_abs_diff_neutral_margin": diff}))
-            print(f"seed {seed}: sanity max |m_neutral diff| = {diff:.4f}")
-            if diff > 0.05:
-                raise RuntimeError("Intervention pipeline does not reproduce behavior margins.")
+        sanity_check(lm, base, test, neu["mean"], sd / "sanity.json", seed)
 
         for b in blocks:
-            common = {"model": args.model, "seed": seed, "block": b,
-                      "test_rows": test.tolist(), "m_neutral": m_neu[test].tolist()}
+            # one block's source vectors for all items, read once (not per training step)
+            layer_src = {c: np.asarray(caches[c][:, b], dtype=np.float32) for c in caches}
+            common = {"model": args.model, "seed": seed, "block": b, "test_rows": test.tolist(),
+                      **{f"m_neutral{sfx}": neu[part][test].tolist()
+                         for part, sfx in [("mean", ""), ("first", "_first"), ("rest", "_rest")]}}
+
+            def eval_all(W):
+                res = {}
+                for c in args.eval_sources:
+                    m = evaluate(lm, base, test, b, layer_src[c], W)
+                    res[c] = {**metrics(m["mean"], tgt[c]["mean"][test], neu["mean"][test]),
+                              "m_int": m["mean"].tolist(), "m_int_first": m["first"].tolist(),
+                              "m_int_rest": m["rest"].tolist(), "m_src": tgt[c]["mean"][test].tolist(),
+                              "m_src_first": tgt[c]["first"][test].tolist(),
+                              "m_src_rest": tgt[c]["rest"][test].tolist()}
+                return res
+
             if "patch" in args.methods:
                 f = sd / f"block{b:02d}__patch.json"
                 if not f.exists():
-                    res = dict(common, method="patch", eval={})
-                    for c in args.eval_sources:
-                        m, mf = evaluate(lm, base, test, b, caches[c])
-                        res["eval"][c] = {**metrics(m, tgt[c][test], m_neu[test]),
-                                          "m_int": m.tolist(), "m_int_first": mf.tolist(),
-                                          "m_src": tgt[c][test].tolist()}
-                    f.write_text(json.dumps(res))
-                    print(f"seed {seed} block {b:2d} patch  "
-                          f"IIA={res['eval'][args.eval_sources[0]]['iia']:.3f}")
+                    res = dict(common, method="patch", eval=eval_all(None))
+                    write_json(f, res)
+                    print(f"seed {seed} block {b:2d} patch  IIA={res['eval'][args.eval_sources[0]]['iia']:.3f}")
             if "das" not in args.methods:
                 continue
             for k in args.ranks:
                 f = sd / f"block{b:02d}__das__k{k}__src-{args.source}.json"
                 if f.exists():
                     continue
+                lr = resolve_lr(args.lr, root, k)
                 t0 = time.time()
                 init_seed = 100_000 * seed + 100 * b + k
-                W, hist = train_das(lm, base, sp["train"], sp["val"], b, caches[args.source],
-                                    tgt[args.source], k, init_seed, steps=args.steps,
+                W, hist = train_das(lm, base, sp["train"], sp["val"], b, layer_src[args.source],
+                                    tgt[args.source]["mean"], k, init_seed, steps=args.steps,
                                     bs=args.bs, lr=lr, eval_every=args.eval_every)
-                from v2.das import Subspace
                 W0 = Subspace(lm.d_model, k, init_seed).to(lm.device)().detach()
-                mu, _ = evaluate(lm, base, test, b, caches[args.source], W0)
+                mu = evaluate(lm, base, test, b, layer_src[args.source], W0)["mean"]
                 res = dict(common, method="das", k=k, source=args.source, lr=lr,
                            steps=args.steps, bs=args.bs, history=hist,
-                           untrained=metrics(mu, tgt[args.source][test], m_neu[test]), eval={})
-                for c in args.eval_sources:
-                    m, mf = evaluate(lm, base, test, b, caches[c], W)
-                    res["eval"][c] = {**metrics(m, tgt[c][test], m_neu[test]),
-                                      "m_int": m.tolist(), "m_int_first": mf.tolist(),
-                                      "m_src": tgt[c][test].tolist()}
+                           untrained=metrics(mu, tgt[args.source]["mean"][test], neu["mean"][test]),
+                           eval=eval_all(W))
                 res["seconds"] = time.time() - t0
                 if args.save_w:
                     torch.save(W.half().cpu(), f.with_suffix(".W.pt"))
-                f.write_text(json.dumps(res))
-                print(f"seed {seed} block {b:2d} das k={k:<4d} "
+                write_json(f, res)  # written last: its existence marks the run as complete
+                print(f"seed {seed} block {b:2d} das k={k:<4d} lr={lr:g} "
                       f"IIA={res['eval'][args.source]['iia']:.3f} "
                       f"r={res['eval'][args.source]['pearson_r']:.3f} ({res['seconds']:.0f}s)")
 
 
-def resolve_lr(spec: str, root: Path) -> float:
+def per_token_margins(nc: list[dict], cond: str) -> dict[str, np.ndarray]:
+    """Mean-token, first-token and rest-token margins of each item under `cond`."""
+    return {"mean": np.array([it["margin"][cond] for it in nc]),
+            "first": np.array([it["margin_first"][cond] for it in nc]),
+            "rest": np.array([rest_margin(it["lp"][cond]["c_plus"], it["lp"][cond]["c_minus"])
+                              for it in nc])}
+
+
+def sanity_check(lm, base, test, m_neu, path: Path, seed: int):
+    """The unintervened pipeline must reproduce the behavior-stage neutral margins up to
+    bf16 noise. Logged every time; aborts only on a clear mismatch."""
+    if path.exists():
+        return
+    m0 = evaluate(lm, base, test, None)["mean"]
+    diff = np.abs(m0 - m_neu[test])
+    rep = {"max_abs_diff": float(diff.max()), "mean_abs_diff": float(diff.mean()),
+           "sign_disagree": float(np.mean((m0 > 0) != (m_neu[test] > 0)))}
+    write_json(path, rep)
+    print(f"seed {seed}: sanity {rep}")
+    if rep["max_abs_diff"] > SANITY_MAX_ABS or rep["sign_disagree"] > SANITY_MAX_SIGN_DISAGREE:
+        raise RuntimeError(f"Intervention pipeline does not reproduce behavior margins: {rep}")
+    if rep["max_abs_diff"] > 0.05:
+        print("  WARNING: differences above 0.05 -- expected bf16 noise, but worth a look.")
+
+
+def resolve_lr(spec: str, root: Path, k: int) -> float:
     if spec != "auto":
         return float(spec)
-    f = root / "calibrate" / "best_lr.json"
-    if f.exists():
-        return float(json.loads(f.read_text())["lr"])
-    print("WARNING: no calibrate/best_lr.json found, falling back to lr=2e-3")
+    for name in [f"best_lr_k{k}.json", "best_lr.json"]:
+        f = root / "calibrate" / name
+        if f.exists():
+            return float(json.loads(f.read_text())["lr"])
+    print("WARNING: no calibrate/best_lr*.json found, falling back to lr=2e-3")
     return 2e-3
 
 
 def calibrate(args, lm, base, caches, tgt, blocks, out_dir):
-    """Picks the DAS learning rate by validation MSE (mean over blocks), never using test."""
+    """Picks the DAS learning rate per rank by validation MSE (mean over blocks); the test
+    split is never touched. Writes best_lr_k<k>.json for every rank and best_lr.json (the
+    k=64 choice, or the first rank's) as the default for ranks that were not calibrated."""
     sp = split(len(base), args.seeds[0])
     rows = []
-    for b in blocks:
-        for lr in args.calibrate_lrs:
-            _, hist = train_das(lm, base, sp["train"], sp["val"], b, caches[args.source],
-                                tgt[args.source], args.ranks[0], 7 + b, steps=args.steps,
-                                bs=args.bs, lr=lr, eval_every=args.eval_every)
-            rows.append({"block": b, "lr": lr, "best_val_mse": hist["best_val_mse"],
-                         "best_step": hist["best_step"], "val_curve": hist["val"]})
-            print(f"calibrate block {b} lr {lr:g}: best val MSE {hist['best_val_mse']:.4f} "
-                  f"at step {hist['best_step']}")
-    (out_dir / f"calibration_blocks{'-'.join(map(str, blocks))}.json").write_text(json.dumps(rows))
-    by_lr = {lr: np.mean([r["best_val_mse"] for r in rows if r["lr"] == lr]) for lr in args.calibrate_lrs}
-    best = min(by_lr, key=by_lr.get)
-    (out_dir / "best_lr.json").write_text(json.dumps({"lr": best, "mean_val_mse": by_lr}))
-    print(f"Best LR: {best}  (mean val MSE by LR: {by_lr})")
+    for k in args.ranks:
+        for b in blocks:
+            src = np.asarray(caches[args.source][:, b], dtype=np.float32)
+            for lr in args.calibrate_lrs:
+                _, hist = train_das(lm, base, sp["train"], sp["val"], b, src, tgt[args.source]["mean"],
+                                    k, 7 + b, steps=args.steps, bs=args.bs, lr=lr,
+                                    eval_every=args.eval_every)
+                rows.append({"k": k, "block": b, "lr": lr, "best_val_mse": hist["best_val_mse"],
+                             "best_step": hist["best_step"], "val_curve": hist["val"]})
+                print(f"calibrate k={k} block {b} lr {lr:g}: best val MSE {hist['best_val_mse']:.4f} "
+                      f"at step {hist['best_step']}/{args.steps}")
+        by_lr = {lr: float(np.mean([r["best_val_mse"] for r in rows if r["lr"] == lr and r["k"] == k]))
+                 for lr in args.calibrate_lrs}
+        best = min(by_lr, key=by_lr.get)
+        write_json(out_dir / f"best_lr_k{k}.json", {"lr": best, "mean_val_mse": by_lr})
+        print(f"k={k}: best LR {best}  (mean val MSE by LR: {by_lr})")
+    write_json(out_dir / f"calibration_blocks{'-'.join(map(str, blocks))}.json", rows)
+    default_k = 64 if 64 in args.ranks else args.ranks[0]
+    write_json(out_dir / "best_lr.json", json.loads((out_dir / f"best_lr_k{default_k}.json").read_text()))
 
 
 if __name__ == "__main__":

@@ -2,9 +2,11 @@
 Aggregates v2 results into tables (CSV + LaTeX) and figures. CPU only, runs in seconds-
 minutes; fine on a login node.
 
-Uncertainty: every interval is a 95% percentile bootstrap that resamples test items within
-each seed and averages over seeds (seeds differ in split and DAS init, so seed variance is
-included through the average). DAS-vs-patch differences are paired on the same items.
+Uncertainty: intervals are 95% percentile bootstraps that resample test items within each
+seed and then average the seeds. They capture item-sampling uncertainty only; variability
+due to the DAS initialization / data split is NOT inside them and is reported separately as
+the across-seed SD (`*_seed_sd` columns; with 3 seeds, resampling seeds would be too crude).
+DAS-vs-patch differences are paired on the same items.
 
 Usage:
     python -m v2.analyze --model llama --results-root $SYCO_RESULTS            # everything
@@ -54,7 +56,7 @@ METRICS = {"iia": v_iia, "balanced_acc": v_bal, "pearson_r": v_r, "shift_recover
 
 def boot(per_seed, fn, paired_with=None):
     """per_seed: list of (m_int, m_src, m_neu) arrays (one tuple per seed). Returns
-    (point, lo, hi); if paired_with is given, statistics are of fn(a) - fn(b)."""
+    (point, lo, hi, seed_sd); if paired_with is given, statistics are of fn(a) - fn(b)."""
     pts, bs = [], []
     for s, tup in enumerate(per_seed):
         n = len(tup[0])
@@ -68,7 +70,8 @@ def boot(per_seed, fn, paired_with=None):
         pts.append(val)
         bs.append(bv)
     bs = np.nanmean(np.stack(bs), axis=0)
-    return float(np.mean(pts)), float(np.nanpercentile(bs, 2.5)), float(np.nanpercentile(bs, 97.5))
+    sd = float(np.std(pts, ddof=1)) if len(pts) > 1 else float("nan")
+    return float(np.mean(pts)), float(np.nanpercentile(bs, 2.5)), float(np.nanpercentile(bs, 97.5)), sd
 
 
 def boot_mean(x):
@@ -181,9 +184,18 @@ def load_runs(root: Path, tag: str):
     return runs
 
 
-def tuples(res_by_seed, src):
-    return [(np.array(r["eval"][src]["m_int"]), np.array(r["eval"][src]["m_src"]),
-             np.array(r["m_neutral"])) for r in res_by_seed]
+def tuples(res_by_seed, src, part=""):
+    """part: "" (mean-token margin), "_first" or "_rest". For "_rest", items whose answers
+    are single tokens (NaN) are dropped; the mask depends only on the items, so DAS and
+    patch tuples of the same seed stay paired."""
+    out = []
+    for r in res_by_seed:
+        e = r["eval"][src]
+        t = [np.array(e[f"m_int{part}"], dtype=float), np.array(e[f"m_src{part}"], dtype=float),
+             np.array(r[f"m_neutral{part}"], dtype=float)]
+        ok = np.all([np.isfinite(x) for x in t], axis=0)
+        out.append(tuple(x[ok] for x in t))
+    return out
 
 
 def analyze_main(root: Path, out: Path, k=64, src=MAIN_SOURCE):
@@ -204,11 +216,23 @@ def analyze_main(root: Path, out: Path, k=64, src=MAIN_SOURCE):
                "untrained_iia": float(np.mean([das[(s, b)]["untrained"]["iia"] for s in seeds]))}
         for m, fn in METRICS.items():
             for name, tt in [("das", td), ("patch", tp)]:
-                row[f"{name}_{m}"], row[f"{name}_{m}_lo"], row[f"{name}_{m}_hi"] = boot(tt, fn)
-            row[f"diff_{m}"], row[f"diff_{m}_lo"], row[f"diff_{m}_hi"] = boot(td, fn, paired_with=tp)
+                (row[f"{name}_{m}"], row[f"{name}_{m}_lo"], row[f"{name}_{m}_hi"],
+                 row[f"{name}_{m}_seed_sd"]) = boot(tt, fn)
+            (row[f"diff_{m}"], row[f"diff_{m}_lo"], row[f"diff_{m}_hi"],
+             row[f"diff_{m}_seed_sd"]) = boot(td, fn, paired_with=tp)
+        # Limitation 1: is the late-layer patching advantage carried by the first answer
+        # token (read directly off the patched position) or also by the later tokens?
+        for part in ["_first", "_rest"]:
+            tdp = tuples([das[(s, b)] for s in seeds], src, part)
+            tpp = tuples([patch[(s, b)] for s in seeds], src, part)
+            for name, tt in [("das", tdp), ("patch", tpp)]:
+                (row[f"{name}_shift_recovered{part}"], row[f"{name}_shift_recovered{part}_lo"],
+                 row[f"{name}_shift_recovered{part}_hi"], _) = boot(tt, v_rec)
+            row[f"n_test{part}"] = len(tdp[0][0])
         rows.append(row)
     write_csv(out / f"main_k{k}.csv", rows)
     _plot_main(rows, out / f"fig_main_k{k}.png")
+    _plot_first_rest(rows, out / f"fig_first_vs_rest_k{k}.png")
     _latex_main(rows, out / f"table_main_k{k}.tex")
 
 
@@ -232,6 +256,33 @@ def _plot_main(rows, path):
         ax.set_xlabel("Decoder block")
         ax.set_title(lab)
         ax.grid(alpha=0.3)
+    axes[0].legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
+def _plot_first_rest(rows, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    x = [r["block"] for r in rows]
+    fig, axes = plt.subplots(1, 3, figsize=(13, 3.4), sharey=True)
+    for ax, part, title in zip(axes, ["", "_first", "_rest"],
+                               ["All answer tokens", "First answer token", "Answer tokens 2..k"]):
+        for name, col in [("patch", "tab:blue"), ("das", "tab:red")]:
+            key = f"{name}_shift_recovered{part}"
+            ax.plot(x, [r[key] for r in rows], color=col, marker="o", ms=3,
+                    label={"patch": "Full patching", "das": "DAS (k=64)"}[name])
+            ax.fill_between(x, [r[key + "_lo"] for r in rows], [r[key + "_hi"] for r in rows],
+                            color=col, alpha=0.15, lw=0)
+        ax.axhline(0, color="k", lw=0.8)
+        ax.axhline(1, color="k", lw=0.8, ls=":")
+        ax.set_title(title + (f" (n={rows[0]['n_test_rest']}/seed)" if part == "_rest" else ""))
+        ax.set_xlabel("Decoder block")
+        ax.grid(alpha=0.3)
+    axes[0].set_ylabel("Fraction of margin shift recovered")
     axes[0].legend(fontsize=7)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
@@ -263,7 +314,7 @@ def analyze_rank(root: Path, out: Path, src=MAIN_SOURCE):
             t = tuples([res[(ss, b)] for ss in seeds], src)
             row = {"block": b, "k": k, "n_seeds": len(seeds)}
             for m in ["iia", "pearson_r", "shift_recovered"]:
-                row[m], row[m + "_lo"], row[m + "_hi"] = boot(t, METRICS[m])
+                row[m], row[m + "_lo"], row[m + "_hi"], row[m + "_seed_sd"] = boot(t, METRICS[m])
             ps = [ss for ss in seeds if (ss, b) in patch]
             if ps:
                 row["patch_pearson_r"] = boot(tuples([patch[(ss, b)] for ss in ps], src), v_r)[0]
