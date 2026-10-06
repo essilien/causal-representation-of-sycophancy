@@ -11,7 +11,12 @@ cd "$(dirname "$0")/../.."
 MODEL=${1:-llama}
 P=${PARTITION:-gpu_a100_il}
 mkdir -p logs
-sub() { sbatch --parsable -p "$P" --export=ALL,MODEL="$MODEL" "$@"; }
+# Email on END/FAIL of each job (array jobs: one mail for the whole array). The address
+# is kept out of this public repo: put `export SYCO_MAIL=you@example.com` in ~/.bashrc.
+MAIL=()
+[ -n "${SYCO_MAIL:-}" ] && MAIL=(--mail-user="$SYCO_MAIL")
+[ -z "${SYCO_MAIL:-}" ] && echo "Note: SYCO_MAIL not set, no email notifications."
+sub() { sbatch --parsable -p "$P" "${MAIL[@]}" --export=ALL,MODEL="$MODEL" "$@"; }
 
 J1=$(sub v2/slurm/behavior.sbatch)
 J2=$(sub --dependency=afterok:"$J1" v2/slurm/calibrate.sbatch)

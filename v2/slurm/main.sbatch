@@ -9,6 +9,7 @@
 #SBATCH --time=06:00:00
 #SBATCH --array=0-11
 #SBATCH --output=logs/%x-%A_%a.out
+#SBATCH --mail-type=END,FAIL   # recipient: --mail-user from submit_all.sh (SYCO_MAIL)
 source v2/slurm/env.sh
 NCHUNK=4
 SEED=$((SLURM_ARRAY_TASK_ID / NCHUNK))

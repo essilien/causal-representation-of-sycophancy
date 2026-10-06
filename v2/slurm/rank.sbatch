@@ -8,6 +8,7 @@
 #SBATCH --time=06:00:00
 #SBATCH --array=0-17
 #SBATCH --output=logs/%x-%A_%a.out
+#SBATCH --mail-type=END,FAIL   # recipient: --mail-user from submit_all.sh (SYCO_MAIL)
 source v2/slurm/env.sh
 RANKS=(1 4 16 64 256 1024)
 K=${RANKS[$((SLURM_ARRAY_TASK_ID % 6))]}

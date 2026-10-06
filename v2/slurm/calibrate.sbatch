@@ -11,6 +11,7 @@
 #SBATCH --mem=64G
 #SBATCH --time=08:00:00
 #SBATCH --output=logs/%x-%j.out
+#SBATCH --mail-type=END,FAIL   # recipient: --mail-user from submit_all.sh (SYCO_MAIL)
 source v2/slurm/env.sh
 python -m v2.run_intervention --model "$MODEL" --results-root "$SYCO_RESULTS" --tag calibrate \
     --seeds 0 --blocks 13,25 --ranks 64 1 1024 --calibrate-lrs 5e-4 2e-3 8e-3

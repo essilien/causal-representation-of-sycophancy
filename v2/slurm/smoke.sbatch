@@ -1,6 +1,6 @@
 #!/bin/bash
 # 30-minute end-to-end check on the real model with 80 questions. Run this FIRST:
-#   sbatch v2/slurm/smoke.sbatch
+#   sbatch --mail-user="$SYCO_MAIL" v2/slurm/smoke.sbatch
 # then read logs/syco-smoke-<jobid>.out. Check that (1) the sanity line reports a small
 # "max |m_neutral diff|", (2) DAS val loss goes down, (3) the per-run seconds are plausible
 # -- multiply them out to check the time limits in main/rank/ablation.sbatch.
@@ -11,6 +11,7 @@
 #SBATCH --mem=64G
 #SBATCH --time=00:30:00
 #SBATCH --output=logs/%x-%j.out
+#SBATCH --mail-type=END,FAIL   # recipient: --mail-user from submit_all.sh (SYCO_MAIL)
 source v2/slurm/env.sh
 R="$SYCO_WS/smoke"
 python -m v2.run_behavior --model "$MODEL" --results-root "$R" --limit 80
