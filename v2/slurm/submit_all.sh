@@ -16,7 +16,7 @@ mkdir -p logs
 MAIL=()
 [ -n "${SYCO_MAIL:-}" ] && MAIL=(--mail-user="$SYCO_MAIL")
 [ -z "${SYCO_MAIL:-}" ] && echo "Note: SYCO_MAIL not set, no email notifications."
-sub() { sbatch --parsable -p "$P" "${MAIL[@]}" --export=ALL,MODEL="$MODEL" "$@"; }
+sub() { sbatch --parsable -p "$P" ${MAIL[@]+"${MAIL[@]}"} --export=ALL,MODEL="$MODEL" "$@"; }
 
 J1=$(sub v2/slurm/behavior.sbatch)
 J2=$(sub --dependency=afterok:"$J1" v2/slurm/calibrate.sbatch)
