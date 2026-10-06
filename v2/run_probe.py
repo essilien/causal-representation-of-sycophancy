@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-from v2.config import MAIN_SOURCE, PRIMARY_MENTION, MODELS
+from v2.config import ABLATION_SOURCES, MAIN_SOURCE, MODELS
 from v2.data import read_jsonl
 
 ALPHAS = np.logspace(-1, 6, 15)
@@ -66,7 +66,7 @@ def main():
     ap.add_argument("--model", choices=list(MODELS), default="llama")
     ap.add_argument("--results-root", required=True)
     ap.add_argument("--conditions", nargs="+",
-                    default=[MAIN_SOURCE, "assert_irrelevant", f"mention_plausible_{PRIMARY_MENTION}"])
+                    default=[MAIN_SOURCE, *ABLATION_SOURCES])
     ap.add_argument("--n-perm", type=int, default=200)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()

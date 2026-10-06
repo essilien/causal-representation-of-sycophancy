@@ -44,7 +44,11 @@ MENTION_TEMPLATES = {
     2: "{question} Ignore the following unrelated text: {x}",
     3: '{question} (The phrase "{x}" has nothing to do with this question.)',
 }
-PRIMARY_MENTION = 1  # wording used as intervention source in the E4 ablation
+# Mention wordings used as intervention sources in the E4 ablation. Two, because the
+# behavioral decomposition is strongly wording-dependent (smoke test: "Random word"
+# attributes most of the shift to entrainment, the other two wordings very little).
+INTERVENTION_MENTIONS = [1, 2]
+PRIMARY_MENTION = INTERVENTION_MENTIONS[0]
 
 CONDITIONS = {"neutral": ("{question}", None),
               "assert_plausible": (ASSERT_TEMPLATE, "plausible"),
@@ -55,9 +59,9 @@ for _t, _tpl in MENTION_TEMPLATES.items():
 
 # Conditions used as intervention sources / evaluation targets.
 MAIN_SOURCE = "assert_plausible"
-ABLATION_SOURCES = ["assert_irrelevant", f"mention_plausible_{PRIMARY_MENTION}"]
-EVAL_SOURCES = [MAIN_SOURCE, "assert_irrelevant",
-                f"mention_plausible_{PRIMARY_MENTION}", f"mention_irrelevant_{PRIMARY_MENTION}"]
+ABLATION_SOURCES = ["assert_irrelevant"] + [f"mention_plausible_{t}" for t in INTERVENTION_MENTIONS]
+EVAL_SOURCES = [MAIN_SOURCE, "assert_irrelevant"] + [
+    f"mention_{c}_{t}" for t in INTERVENTION_MENTIONS for c in ("plausible", "irrelevant")]
 
 
 def build_prompt(cond: str, item: dict) -> str:

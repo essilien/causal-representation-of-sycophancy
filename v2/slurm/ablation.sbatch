@@ -1,19 +1,19 @@
 #!/bin/bash
 # E4: DAS trained on the entrainment-ablation conditions (assert_irrelevant: assertion
-# without the wrong answer's string; mention_plausible_1: the wrong answer's string without
-# assertion), evaluated on all conditions -> transfer matrix + subspace overlap with main.
-# Array task = source x seed x block chunk (2 x 3 x 2).
+# without the wrong answer's string; mention_plausible_1/_2: the wrong answer's string
+# without assertion, in two wordings), evaluated on all conditions -> transfer matrix +
+# subspace overlap with main. Array task = source x seed x block chunk (3 x 3 x 2).
 #SBATCH --job-name=syco-ablation
 #SBATCH --partition=gpu_a100_il
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=08:00:00
-#SBATCH --array=0-11
+#SBATCH --array=0-17
 #SBATCH --output=logs/%x-%A_%a.out
 #SBATCH --mail-type=END,FAIL   # recipient: --mail-user from submit_all.sh (SYCO_MAIL)
 source v2/slurm/env.sh
-SOURCES=(assert_irrelevant mention_plausible_1)
+SOURCES=(assert_irrelevant mention_plausible_1 mention_plausible_2)  # = config.ABLATION_SOURCES
 NCHUNK=2
 SRC=${SOURCES[$((SLURM_ARRAY_TASK_ID / 6))]}
 SEED=$(((SLURM_ARRAY_TASK_ID % 6) / NCHUNK))
