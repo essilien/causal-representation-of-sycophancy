@@ -155,6 +155,13 @@ def test_integration(dataset_path):
             run(run_intervention, "--tag", "ablation", "--seeds", "0", "1", "--blocks", "all",
                 "--methods", "das", "--ranks", "4", "--source", src, "--steps", "10", "--bs", "4",
                 "--eval-every", "5")
+        from v2 import run_illusion_control
+        run(run_illusion_control, "--seeds", "0", "1", "--k", "4")
+        from v2.run_illusion_control import derangement
+        pm = derangement(7, np.random.default_rng(0))
+        assert sorted(pm) == list(range(7)) and all(pm[i] != i for i in range(7))
+        n_ill = len(list((root / "illusion").glob("seed*/block*.json")))
+        assert n_ill == 2 * 4 * 2, n_ill  # seeds x blocks x {das, patch}
         n_main = len(list((root / "main").glob("seed*/block*.json")))
         assert n_main == 2 * 4 * 2, n_main  # seeds x blocks x {patch, das}
         sys.argv = ["x", "--results-root", tmp]
@@ -163,11 +170,12 @@ def test_integration(dataset_path):
         analyze.analyze_transfer(root, root / "analysis", k=4)
         analyze.analyze_main(root, root / "analysis", k=4)
         analyze.analyze_rank(root, root / "analysis")
+        analyze.analyze_illusion(root, root / "analysis")
         produced = sorted(p.name for p in (root / "analysis").iterdir())
         print("analysis outputs:", produced)
         import csv
         row = next(csv.DictReader(open(root / "analysis" / "main_k4.csv")))
-        for col in ["das_iia_seed_sd", "diff_iia_seed_sd", "das_shift_recovered_first",
+        for col in ["das_iia_seed_sd", "diff_iia_seed_sd", "das_shift_recovered_first", "das_shift_r",
                     "patch_shift_recovered_rest", "n_test_rest"]:
             assert col in row, f"missing column {col}"
         assert (root / "calibrate" / "best_lr_k4.json").exists() and (root / "calibrate" / "best_lr_k16.json").exists()
@@ -191,6 +199,7 @@ def test_integration(dataset_path):
         except RuntimeError:
             pass
         for f in ["behavior.md", "main_k4.csv", "fig_main_k4.png", "fig_first_vs_rest_k4.png",
+                  "illusion.csv", "fig_illusion.png",
                   "rank.csv", "transfer_k4.csv",
                   "subspace_overlap_k4.csv", "fig_probe.png", "table_main_k4.tex"]:
             assert f in produced, f"missing {f}"

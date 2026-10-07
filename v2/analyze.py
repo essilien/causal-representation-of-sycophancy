@@ -51,7 +51,15 @@ def v_rec(mi, ms, mn):
         return (mi - mn).mean(-1) / (ms - mn).mean(-1)
 
 
-METRICS = {"iia": v_iia, "balanced_acc": v_bal, "pearson_r": v_r, "shift_recovered": v_rec}
+def v_rshift(mi, ms, mn):
+    """Correlation of SHIFTS (m_int - m_neu vs. m_src - m_neu). Unlike v_r it is not
+    inflated by the neutral margin both terms share (full patching at block 0 changes
+    nothing yet has v_r ~ 0.58)."""
+    return v_r(mi - mn, ms - mn, mn)
+
+
+METRICS = {"iia": v_iia, "balanced_acc": v_bal, "pearson_r": v_r, "shift_r": v_rshift,
+           "shift_recovered": v_rec}
 
 
 def boot(per_seed, fn, paired_with=None):
@@ -242,7 +250,7 @@ def _plot_main(rows, path):
     import matplotlib.pyplot as plt
     x = [r["block"] for r in rows]
     fig, axes = plt.subplots(1, 3, figsize=(13, 3.6))
-    for ax, m, lab in zip(axes, ["iia", "balanced_acc", "pearson_r"], ["IIA", "Balanced accuracy", "Pearson r"]):
+    for ax, m, lab in zip(axes, ["iia", "balanced_acc", "shift_r"], ["IIA", "Balanced accuracy", "Shift correlation"]):
         for name, col, mk in [("patch", "tab:blue", "o"), ("das", "tab:red", "s")]:
             y = [r[f"{name}_{m}"] for r in rows]
             ax.plot(x, y, color=col, marker=mk, ms=3, label={"patch": "Full patching", "das": "DAS (k=64)"}[name])
@@ -383,6 +391,52 @@ def analyze_transfer(root: Path, out: Path, k=64):
     write_csv(out / f"subspace_overlap_k{k}.csv", ov)
 
 
+def analyze_illusion(root: Path, out: Path):
+    """Shift recovered (vs. each item's own true shift) when the trained W is fed sources that
+    should not reproduce it. See v2/run_illusion_control.py."""
+    files = sorted((root / "illusion").glob("seed*/block*.json"))
+    if not files:
+        print("  illusion: no results yet")
+        return
+    runs = defaultdict(list)
+    for f in files:
+        r = json.loads(f.read_text())
+        runs[(r["block"], r["method"])].append(r)
+    rows = []
+    for (b, method), rs in sorted(runs.items()):
+        row = {"block": b, "method": method, "n_seeds": len(rs)}
+        for c in rs[0]["controls"]:
+            for part, sfx in [("", ""), ("_first", "_first")]:
+                t = [(np.array(r["controls"][c][f"m_int{part}"]), np.array(r[f"m_src{part}"]),
+                      np.array(r[f"m_neutral{part}"])) for r in rs]
+                (row[f"{c}{sfx}"], row[f"{c}{sfx}_lo"], row[f"{c}{sfx}_hi"], _) = boot(t, v_rec)
+        rows.append(row)
+    write_csv(out / "illusion.csv", rows)
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.4), sharey=True)
+    styles = {"matched": "-", "other_biased": "--", "other_neutral": ":"}
+    for ax, method in zip(axes, ["das", "patch"]):
+        rr = [r for r in rows if r["method"] == method]
+        x = [r["block"] for r in rr]
+        for c, ls in styles.items():
+            if f"{c}_first" not in rr[0]:
+                continue
+            ax.plot(x, [r[f"{c}_first"] for r in rr], ls, marker="o", ms=2.5, label=c.replace("_", " "))
+            ax.fill_between(x, [r[f"{c}_first_lo"] for r in rr], [r[f"{c}_first_hi"] for r in rr], alpha=0.12, lw=0)
+        ax.axhline(0, color="k", lw=0.8)
+        ax.set_title({"das": "DAS (k=64)", "patch": "Full patching"}[method] + ": source")
+        ax.set_xlabel("Decoder block")
+        ax.grid(alpha=0.3)
+    axes[0].set_ylabel("First-token shift recovered\n(relative to item's own shift)")
+    axes[0].legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(out / "fig_illusion.png", dpi=200)
+    plt.close(fig)
+    print(f"  wrote {out / 'fig_illusion.png'}")
+
+
 def analyze_probe(root: Path, out: Path):
     f = root / "probe.json"
     if not f.exists():
@@ -412,7 +466,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="llama")
     ap.add_argument("--results-root", required=True)
-    ap.add_argument("--only", nargs="+", default=["behavior", "probe", "main", "rank", "transfer"])
+    ap.add_argument("--only", nargs="+", default=["behavior", "probe", "main", "rank", "transfer", "illusion"])
     args = ap.parse_args()
     root = Path(args.results_root) / args.model
     out = root / "analysis"
@@ -420,7 +474,7 @@ def main():
     for part in args.only:
         print(f"== {part} ==")
         {"behavior": analyze_behavior, "probe": analyze_probe, "main": analyze_main,
-         "rank": analyze_rank, "transfer": analyze_transfer}[part](root, out)
+         "rank": analyze_rank, "transfer": analyze_transfer, "illusion": analyze_illusion}[part](root, out)
 
 
 if __name__ == "__main__":
