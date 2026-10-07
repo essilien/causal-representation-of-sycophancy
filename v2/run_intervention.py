@@ -179,10 +179,13 @@ def sanity_check(lm, base, test, m_neu, path: Path, seed: int):
     diff = np.abs(m0 - m_neu[test])
     rep = {"max_abs_diff": float(diff.max()), "mean_abs_diff": float(diff.mean()),
            "sign_disagree": float(np.mean((m0 > 0) != (m_neu[test] > 0)))}
-    write_json(path, rep)
     print(f"seed {seed}: sanity {rep}")
     if rep["mean_abs_diff"] > SANITY_MAX_MEAN_ABS or rep["sign_disagree"] > SANITY_MAX_SIGN_DISAGREE:
+        # Keep the failing numbers for inspection, but do NOT create sanity.json: its
+        # existence makes other array tasks of this seed skip the check.
+        write_json(path.with_name("sanity_FAILED.json"), rep)
         raise RuntimeError(f"Intervention pipeline does not reproduce behavior margins: {rep}")
+    write_json(path, rep)
     if rep["max_abs_diff"] > 0.05:
         print("  WARNING: max difference above 0.05 -- expected bf16 noise if the mean is small.")
 

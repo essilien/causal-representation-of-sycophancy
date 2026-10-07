@@ -171,6 +171,19 @@ def test_integration(dataset_path):
                     "patch_shift_recovered_rest", "n_test_rest"]:
             assert col in row, f"missing column {col}"
         assert (root / "calibrate" / "best_lr_k4.json").exists() and (root / "calibrate" / "best_lr_k16.json").exists()
+        # a failed sanity check must not leave sanity.json behind (other tasks would skip it)
+        import v2.run_intervention as ri
+        from v2.das import BaseItem as BI
+        from v2.lm import LM as _LM
+        lm_t = _LM.load("x")
+        bi = [BI([1, 5, 6, 2], [7], [8]) for _ in range(4)]
+        sp = Path(tmp) / "sanity_test"; sp.mkdir()
+        try:
+            ri.sanity_check(lm_t, bi, np.arange(4), np.full(4, 100.0), sp / "sanity.json", 0)
+            raise AssertionError("sanity check should have failed")
+        except RuntimeError:
+            pass
+        assert not (sp / "sanity.json").exists() and (sp / "sanity_FAILED.json").exists()
         # resuming with a different question set must refuse instead of mixing results
         try:
             run(run_behavior, "--limit", "50", "--bs", "16")
