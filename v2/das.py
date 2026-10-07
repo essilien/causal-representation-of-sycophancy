@@ -52,7 +52,12 @@ def margins(lm: LM, items: list[BaseItem], idx, layer: int | None = None,
     if src is not None:
         pos_t = torch.tensor(pos, device=lm.device)
         fn = patch_fn(pos_t, src.repeat_interleave(2, dim=0), W)
-    lps = lm.token_logprobs(seqs, layer, fn)
+    return pair_margins(lm.token_logprobs(seqs, layer, fn))
+
+
+def pair_margins(lps: list[torch.Tensor]):
+    """Per-token log-probs of interleaved (c_plus, c_minus) sequences -> (mean-token,
+    first-token, rest) margins, one per pair."""
     mean = torch.stack([lp.mean() for lp in lps])
     first = torch.stack([lp[0] for lp in lps])
     nan = mean.new_tensor(float("nan"))

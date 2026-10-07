@@ -477,6 +477,96 @@ def analyze_illusion(root: Path, out: Path):
     print(f"  wrote {out / 'fig_illusion.png'}")
 
 
+def _position_rows(files, conditions, ref):
+    """One row per block: for each condition, the fraction v_rec(m_cond, m_target, m_base)
+    with item-bootstrap CI, per margin part. `conditions` maps a column name to
+    (condition key, target, base), where target/base name a run in `margins` or a stored
+    reference array (`ref` maps names to the JSON fields)."""
+    rows = []
+    for f in files:
+        r = json.loads(f.read_text())
+        mg = r["margins"]
+
+        def arr(name, part):
+            sfx = "" if part == "mean" else f"_{part}"
+            return np.array(r[ref[name] + sfx] if name in ref else mg[name][part], dtype=float)
+        row = {"block": r["block"], "n_items": len(r["rows"])}
+        for col, (cond, target, base) in conditions.items():
+            for part in ["mean", "first", "rest"]:
+                t = [arr(cond, part), arr(target, part), arr(base, part)]
+                ok = np.all([np.isfinite(x) for x in t], axis=0)
+                pt, lo, hi, _ = boot([tuple(x[ok] for x in t)], v_rec)
+                sfx = "" if part == "mean" else f"_{part}"
+                row[f"{col}{sfx}"], row[f"{col}{sfx}_lo"], row[f"{col}{sfx}_hi"] = pt, lo, hi
+        rows.append(row)
+    return rows
+
+
+def _plot_positions(rows, panels, path, ylabel):
+    """panels: list of (title, [(column, label), ...]); first-token and rest columns."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    x = [r["block"] for r in rows]
+    fig, axes = plt.subplots(len(panels), 2, figsize=(11, 3.2 * len(panels)), sharex=True, squeeze=False)
+    for i, (title, cols) in enumerate(panels):
+        for j, (part, ptitle) in enumerate([("_first", "first answer token"), ("_rest", "answer tokens 2..k")]):
+            ax = axes[i, j]
+            for col, label in cols:
+                ax.plot(x, [r[col + part] for r in rows], marker="o", ms=2.5, label=label)
+                ax.fill_between(x, [r[col + part + "_lo"] for r in rows], [r[col + part + "_hi"] for r in rows],
+                                alpha=0.12, lw=0)
+            ax.axhline(0, color="k", lw=0.8)
+            ax.axhline(1, color="k", lw=0.8, ls=":")
+            ax.set_title(f"{title}: {ptitle}")
+            ax.grid(alpha=0.3)
+            if j == 0:
+                ax.set_ylabel(ylabel)
+        axes[i, 0].legend(fontsize=7)
+    for ax in axes[-1]:
+        ax.set_xlabel("Decoder block")
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
+def analyze_tracing(root: Path, out: Path):
+    """Causal tracing (v2/run_tracing.py): fraction of the clean-vs-corrupted margin
+    difference restored / removed by setting one (block, position group)."""
+    files = sorted((root / "tracing").glob("block*.json"))
+    if not files:
+        print("  tracing: no results yet")
+        return
+    groups = json.loads(files[0].read_text())["groups"]
+    conds = {"corruption_strength": ("corr", "neutral", "clean")}
+    conds |= {f"restore_{g}": (f"restore/{g}", "clean", "corr") for g in groups}
+    conds |= {f"remove_{g}": (f"remove/{g}", "corr", "clean") for g in groups}
+    rows = _position_rows(files, conds, {"neutral": "m_neutral"})
+    write_csv(out / "tracing.csv", rows)
+    _plot_positions(rows, [("Restore clean state (sufficiency)", [(f"restore_{g}", g) for g in groups]),
+                           ("Remove: insert corrupted state (necessity)", [(f"remove_{g}", g) for g in groups])],
+                    out / "fig_tracing.png", "Fraction of clean-corrupted\nmargin difference")
+
+
+def analyze_knockout(root: Path, out: Path):
+    """Attention knockout (v2/run_knockout.py): fraction of the sycophantic shift
+    (biased - neutral margin) eliminated when later positions cannot attend to the
+    assertion in a window of blocks."""
+    from v2.run_knockout import KEYS, QUERIES, WINDOWS
+    files = sorted((root / "knockout").glob("block*.json"))
+    if not files:
+        print("  knockout: no results yet")
+        return
+    conds = {f"{w}_{k}_{q}": (f"{w}/{k}/{q}", "neutral", "biased") for w in WINDOWS for k in KEYS for q in QUERIES}
+    rows = _position_rows(files, conds, {"neutral": "m_neutral"})
+    write_csv(out / "knockout.csv", rows)
+    w = json.loads(files[0].read_text())["window"]
+    _plot_positions(rows, [(f"Blocked from block b on", [(f"from_{k}_after", k) for k in KEYS]),
+                           (f"Blocked in blocks b..b+{w - 1}", [(f"win_{k}_after", k) for k in KEYS])],
+                    out / "fig_knockout.png", "Fraction of sycophantic\nshift eliminated")
+
+
 def analyze_probe(root: Path, out: Path):
     f = root / "probe.json"
     if not f.exists():
@@ -506,7 +596,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="llama")
     ap.add_argument("--results-root", required=True)
-    ap.add_argument("--only", nargs="+", default=["behavior", "probe", "main", "rank", "transfer", "illusion"])
+    ap.add_argument("--only", nargs="+", default=["behavior", "probe", "main", "rank", "transfer", "illusion", "tracing", "knockout"])
     args = ap.parse_args()
     root = Path(args.results_root) / args.model
     out = root / "analysis"
@@ -514,7 +604,8 @@ def main():
     for part in args.only:
         print(f"== {part} ==")
         {"behavior": analyze_behavior, "probe": analyze_probe, "main": analyze_main,
-         "rank": analyze_rank, "transfer": analyze_transfer, "illusion": analyze_illusion}[part](root, out)
+         "rank": analyze_rank, "transfer": analyze_transfer, "illusion": analyze_illusion,
+         "tracing": analyze_tracing, "knockout": analyze_knockout}[part](root, out)
 
 
 if __name__ == "__main__":

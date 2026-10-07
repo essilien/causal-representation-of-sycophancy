@@ -61,6 +61,24 @@ class LM:
             tokenize=False, add_generation_prompt=True)
         return self.tok(chat, add_special_tokens=False).input_ids
 
+    def encode_prompt_offsets(self, user_text: str):
+        """Same ids as encode_prompt, plus each token's (start, end) character span within
+        user_text, or None for tokens outside it (system prompt, chat-template tokens).
+        Offsets come from the same tokenization, so no merge-boundary mismatch is possible."""
+        chat = self.tok.apply_chat_template(
+            [{"role": "system", "content": self.system_prompt},
+             {"role": "user", "content": user_text}],
+            tokenize=False, add_generation_prompt=True)
+        start = chat.rfind(user_text)
+        if start < 0:
+            raise ValueError("chat template altered the user text; cannot locate it")
+        enc = self.tok(chat, add_special_tokens=False, return_offsets_mapping=True)
+        offs = []
+        for s, e in enc.offset_mapping:
+            s, e = max(s - start, 0), min(e - start, len(user_text))
+            offs.append((s, e) if s < e else None)
+        return enc.input_ids, offs
+
     def encode_answer(self, text: str) -> list[int]:
         # No leading space (v1 prepended " "): after the assistant header the model's own
         # first token has no leading space, so this is the natural continuation.

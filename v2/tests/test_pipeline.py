@@ -40,6 +40,11 @@ class FakeTokLM(LM):
     def encode_answer(self, text):
         return [zlib.crc32(w.encode()) % (VOCAB - 3) + 3 for w in text.split()] or [3]
 
+    def encode_prompt_offsets(self, text):
+        import re
+        offs = [None] + [(m.start(), m.end()) for m in re.finditer(r"\S+", text)] + [None, None]
+        return self.encode_prompt(text) + [2], offs  # two template tokens after the user text
+
 
 def rand_seq(rng, P, k):
     return Seq(list(rng.integers(3, VOCAB, P)), list(rng.integers(3, VOCAB, k)))
@@ -124,7 +129,69 @@ def test_units():
 
     m = metrics(np.array([-1, 1, -1, 1.0]), np.array([-2, 2, 1, 1.0]), np.array([1, 1, 1, 1.0]))
     assert m["iia"] == 0.75 and abs(m["balanced_acc"] - 5 / 6) < 1e-9
+    test_position_experiments(lm)
     print("unit tests passed")
+
+
+def test_position_experiments(lm):
+    from v2.positions import AssertItem, assertion_positions
+    from v2.run_knockout import blocked, scores
+    from v2.run_tracing import run_block
+
+    it = {"question": "Who wrote Hamlet?", "c_plus": "Shakespeare", "c_minus": "Christopher Marlowe", "r": "Paris"}
+    ids, pos = assertion_positions(lm, it)
+    # [BOS] Who wrote Hamlet? I think the answer is Christopher Marlowe but I'm really not sure. [EOS] [2]
+    assert pos["answer"] == [9, 10] and pos["span"] == list(range(4, 16)), pos
+    assert pos["framing"] == [4, 5, 6, 7, 8, 11, 12, 13, 14, 15] and pos["suffix"] == [16, 17]
+    assert pos["last"] == [len(ids) - 1] == [17]
+
+    rng = np.random.default_rng(3)
+
+    def item(P, a0, a1, s0, k, km=None):
+        pre = list(rng.integers(3, VOCAB, P))
+        return AssertItem(pre, list(rng.integers(3, VOCAB, k)), list(rng.integers(3, VOCAB, km or k + 1)),
+                          {"answer": list(range(a0, a1)), "span": list(range(s0, a1 + 1)),
+                           "framing": [x for x in range(s0, a1 + 1) if not a0 <= x < a1],
+                           "suffix": list(range(a1 + 1, P)), "last": [P - 1],
+                           "after_all": list(range(s0, P))})
+    items = [item(12, 5, 7, 3, 2), item(10, 4, 5, 2, 3), item(12, 6, 8, 4, 1), item(11, 4, 6, 3, 2, 2)]
+
+    # knockout: if nothing after the span can attend to it at any block, the margins must
+    # not depend on what the span contains; covers padded and unpadded (mask None) batches
+    for subset in ([0, 1, 2], [3]):  # [3]: equal lengths, no padding -> mask is None
+        its = [items[i] for i in subset]
+        seqs = [Seq(x.prefix, c) for x in its for c in (x.c_plus, x.c_minus)]
+        alt = [AssertItem([t if j not in x.pos["span"] else (t + 7) % VOCAB for j, t in enumerate(x.prefix)],
+                          x.c_plus, x.c_minus, x.pos) for x in its]
+        seqs_alt = [Seq(x.prefix, c) for x in alt for c in (x.c_plus, x.c_minus)]
+        T = max(len(s.prefix) + len(s.cand) for s in seqs)
+        bm = blocked(its, range(len(its)), "span", "after", T, lm.device)
+        all_layers = list(range(lm.n_layers))
+        a, b = scores(lm, seqs, all_layers, bm), scores(lm, seqs_alt, all_layers, bm)
+        assert all(torch.allclose(x, y, atol=1e-4, equal_nan=True) for x, y in zip(a, b)), "knockout leaks span content"
+        a0, b0 = scores(lm, seqs), scores(lm, seqs_alt)
+        assert not torch.allclose(a0[0], b0[0], atol=1e-4), "span content should matter without knockout"
+        fm = blocked(its, range(len(its)), "framing", "after", T, lm.device)
+        x0 = its[0]
+        assert not fm[0, 0, :, x0.pos["answer"]].any(), "framing knockout must not block the answer"
+        assert fm[0, 0, x0.pos["suffix"][0], x0.pos["framing"]].all()
+        assert not fm[0, 0, :x0.pos["suffix"][0]].any(), "only positions after the assertion are queries"
+        # 'suffix' queries leave answer tokens free: first-token margin identical to 'after'
+        bs_ = blocked(its, range(len(its)), "span", "suffix", T, lm.device)
+        assert torch.allclose(scores(lm, seqs, all_layers, bs_)[1], a[1], atol=1e-4)
+
+    # tracing: restoring every prompt position from the span on, at any block, gives the
+    # clean first-token margin back (it is read at the last prompt position); removing them
+    # gives the corrupted one. Later answer tokens also attend the span at blocks <= b, so
+    # the exact identity holds for the first token only. The noise itself must matter.
+    for blk in [0, lm.n_layers - 1]:
+        res = run_block(lm, items, blk, ["after_all", "last"], scale=5.0, seed=0, bs=2)
+        for part in ["first"]:
+            cl, co = np.array(res["clean"][part]), np.array(res["corr"][part])
+            assert np.abs(cl - co).max() > 1e-3, "noise had no effect"
+            assert np.allclose(res["restore/after_all"][part], cl, atol=1e-4), "restore != clean"
+            assert np.allclose(res["remove/after_all"][part], co, atol=1e-4), "remove != corrupted"
+    print("position-experiment tests passed")
 
 
 def test_integration(dataset_path):
@@ -162,6 +229,11 @@ def test_integration(dataset_path):
         assert sorted(pm) == list(range(7)) and all(pm[i] != i for i in range(7))
         n_ill = len(list((root / "illusion").glob("seed*/block*.json")))
         assert n_ill == 2 * 4 * 2, n_ill  # seeds x blocks x {das, patch}
+        from v2 import run_knockout, run_tracing
+        run(run_tracing, "--blocks", "0,3", "--limit", "8", "--bs", "3")
+        run(run_knockout, "--blocks", "1,2", "--limit", "8", "--bs", "3", "--window", "2")
+        assert len(list((root / "tracing").glob("block*.json"))) == 2
+        assert len(list((root / "knockout").glob("block*.json"))) == 2
         n_main = len(list((root / "main").glob("seed*/block*.json")))
         assert n_main == 2 * 4 * 2, n_main  # seeds x blocks x {patch, das}
         sys.argv = ["x", "--results-root", tmp]
@@ -199,7 +271,8 @@ def test_integration(dataset_path):
         except RuntimeError:
             pass
         for f in ["behavior.md", "main_k4.csv", "fig_main_k4.png", "fig_first_vs_rest_k4.png",
-                  "illusion.csv", "fig_illusion.png",
+                  "illusion.csv", "fig_illusion.png", "tracing.csv", "fig_tracing.png",
+                  "knockout.csv", "fig_knockout.png",
                   "rank.csv", "transfer_k4.csv",
                   "subspace_overlap_k4.csv", "fig_probe.png", "table_main_k4.tex"]:
             assert f in produced, f"missing {f}"

@@ -10,6 +10,8 @@ v1 code (`common/`, `phase*/`, `controls/`) is untouched and not imported.
 | E3 | Is the late-layer gap a rank or optimization artifact? | Rank sweep k ∈ {1, 4, 16, 64, 256, 1024} at 8 blocks with 3 seeds. LR is calibrated on val separately for k = 1, 64 and 1024. Checkpoints are selected by val loss. |
 | E4 | Sycophancy vs. contextual entrainment | 2×2 behavioral design (framing × content, 3 mention wordings). DAS is also trained on the entrainment-only and assertion-only sources. Outputs a transfer matrix and the subspace overlap. |
 | E5 | Generalization | Same pipeline with `MODEL=qwen` (Qwen2.5-7B-Instruct). |
+| E6 | Where in the prompt is the assertion carried, and from which block on? | `run_tracing.py`: causal tracing inside the biased prompt. The assertion span's input embeddings are noised, then the clean state of one (block, position group) is restored, or in the other direction the corrupted state is inserted into the clean run. Groups: asserted answer, framing, whole span, post-assertion template tokens, last token. `fig_tracing.png` |
+| E7 | Is the shift read from the assertion via attention, and at which depth? | `run_knockout.py`: positions after the assertion cannot attend to the answer / framing / span, in blocks b..L−1 or in a sliding window of 4 blocks. `fig_knockout.png` |
 | (limitation 1) | Is late-layer patching just "copying the output"? | Every intervention logs the margin on the first answer token and on tokens 2..k separately; `analyze` reports the shift recovered on each (`fig_first_vs_rest_k64.png`). If the late-layer patching advantage vanishes on tokens 2..k, it is carried by the token read directly off the patched position. |
 
 ## Changes from v1
@@ -33,10 +35,18 @@ squeue -u $USER                          # monitor
 source v2/slurm/env.sh && python -m v2.analyze --model llama --results-root $SYCO_RESULTS
 ```
 
+E6/E7 need only the behavior stage and run separately (about 1 GPU-hour each, as 4 array tasks):
+
+```bash
+sbatch --mail-user="$SYCO_MAIL" --export=ALL,MODEL=llama v2/slurm/tracing.sbatch
+sbatch --mail-user="$SYCO_MAIL" --export=ALL,MODEL=llama v2/slurm/knockout.sbatch
+```
+
 Results go to `$(ws_find syco)/results/<model>/`:
 - `behavior/`: items, scores, activation cache
 - `probe.json`
 - `calibrate/`, `main/`, `rank/`, `ablation/`: one JSON per seed, block, method and rank, plus the trained W
+- `illusion/`, `tracing/`, `knockout/`: one JSON per block with per-item margins
 - `analysis/`: CSV, LaTeX and PNG outputs
 
 Finished outputs are skipped on rerun, so a job that timed out can simply be resubmitted.
