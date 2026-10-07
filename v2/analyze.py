@@ -375,18 +375,27 @@ def analyze_transfer(root: Path, out: Path, k=64):
                 t = tuples([runs[tr][(s, b)] for s in seeds], ev)
                 rows.append({"block": b, "train_source": tr, "eval_source": ev, "n_seeds": len(seeds),
                              "shift_recovered": boot(t, v_rec)[0], "pearson_r": boot(t, v_r)[0]})
+        # Sources trained with the same seed share their initialization and stay close to it
+        # (see init_check), so only pairs from DIFFERENT seeds measure learned overlap; the
+        # same-seed value is kept for reference only.
+        def w(src, s):
+            f = root / ("main" if src == MAIN_SOURCE else "ablation") / f"seed{s}" / f"block{b:02d}__das__k{k}__src-{src}.W.pt"
+            return torch.load(f).float() if f.exists() else None
         for i, a in enumerate(srcs):
             for c in srcs[i + 1:]:
-                vals = []
-                for s in sorted({s for s, bb in runs[a] if bb == b} & {s for s, bb in runs[c] if bb == b}):
-                    fa = root / ("main" if a == MAIN_SOURCE else "ablation") / f"seed{s}" / f"block{b:02d}__das__k{k}__src-{a}.W.pt"
-                    fc = root / ("main" if c == MAIN_SOURCE else "ablation") / f"seed{s}" / f"block{b:02d}__das__k{k}__src-{c}.W.pt"
-                    if fa.exists() and fc.exists():
-                        Wa, Wc = torch.load(fa).float(), torch.load(fc).float()
-                        vals.append(float((Wa.T @ Wc).pow(2).sum() / k))
-                if vals:
-                    ov.append({"block": b, "source_a": a, "source_b": c, "overlap": float(np.mean(vals)),
-                               "random_baseline": k / Wa.shape[0], "n_seeds": len(vals)})
+                sa = [s for s, bb in runs[a] if bb == b]
+                sc = [s for s, bb in runs[c] if bb == b]
+                Wa_, Wc_ = {s: w(a, s) for s in sa}, {s: w(c, s) for s in sc}
+                same, diff = [], []
+                for s1, Wa in Wa_.items():
+                    for s2, Wc in Wc_.items():
+                        if Wa is not None and Wc is not None:
+                            (same if s1 == s2 else diff).append(float((Wa.T @ Wc).pow(2).sum() / k))
+                if diff:
+                    ov.append({"block": b, "source_a": a, "source_b": c, "overlap": float(np.mean(diff)),
+                               "same_seed_overlap_confounded": float(np.mean(same)) if same else float("nan"),
+                               "random_baseline": k / next(x for x in Wa_.values() if x is not None).shape[0],
+                               "n_pairs": len(diff)})
     write_csv(out / f"transfer_k{k}.csv", rows)
     write_csv(out / f"subspace_overlap_k{k}.csv", ov)
     write_csv(out / f"subspace_init_check_k{k}.csv", init_check(root, runs, blocks, k))
