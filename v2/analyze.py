@@ -389,6 +389,37 @@ def analyze_transfer(root: Path, out: Path, k=64):
                                "random_baseline": k / Wa.shape[0], "n_seeds": len(vals)})
     write_csv(out / f"transfer_k{k}.csv", rows)
     write_csv(out / f"subspace_overlap_k{k}.csv", ov)
+    write_csv(out / f"subspace_init_check_k{k}.csv", init_check(root, runs, blocks, k))
+
+
+def init_check(root: Path, runs, blocks, k):
+    """Controls for subspace_overlap: all sources at the same (seed, block, k) start from the
+    SAME initialization (see run_intervention.init_seed), so a high cross-source overlap
+    could be inherited from the init. Reports, per block and source, the overlap of each
+    trained W with its own init (`to_init`) and between seeds of the same source, which
+    start from different inits (`cross_seed`)."""
+    import torch
+    from v2.das import Subspace
+    rows = []
+    for b in blocks:
+        for src in sorted(runs):
+            tag = "main" if src == MAIN_SOURCE else "ablation"
+            Ws, to_init = {}, []
+            for s in sorted({s for s, bb in runs[src] if bb == b}):
+                f = root / tag / f"seed{s}" / f"block{b:02d}__das__k{k}__src-{src}.W.pt"
+                if not f.exists():
+                    continue
+                W = torch.load(f).float()
+                W0 = Subspace(W.shape[0], k, 100_000 * s + 100 * b + k)().detach()
+                to_init.append(float((W.T @ W0).pow(2).sum() / k))
+                Ws[s] = W
+            ss = sorted(Ws)
+            cross = [float((Ws[a].T @ Ws[c]).pow(2).sum() / k) for i, a in enumerate(ss) for c in ss[i + 1:]]
+            if to_init:
+                rows.append({"block": b, "source": src, "to_init": float(np.mean(to_init)),
+                             "cross_seed": float(np.mean(cross)) if cross else float("nan"),
+                             "random_baseline": k / next(iter(Ws.values())).shape[0], "n_seeds": len(ss)})
+    return rows
 
 
 def analyze_illusion(root: Path, out: Path):
