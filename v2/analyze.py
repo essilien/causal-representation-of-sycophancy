@@ -609,9 +609,11 @@ def analyze_knockout(root: Path, out: Path):
         return
     all_rows = {}
     for cfg, runs in sorted(configs.items()):
-        keys = next(iter(runs.values()))[0].get("keys", KEYS)
-        conds = {f"{w}_{k}_{q}": (f"{w}/{k}/{q}", "neutral", "biased")
-                 for w in WINDOWS for k in keys for q in QUERIES}
+        first = next(iter(runs.values()))[0]
+        keys = first.get("keys", KEYS)
+        variants = [tuple(v) for v in first.get("variants", [])] or \
+            [(w, k, q) for w in WINDOWS for k in keys for q in QUERIES]
+        conds = {f"{w}_{k}_{q}": (f"{w}/{k}/{q}", "neutral", "biased") for w, k, q in variants}
         conds["shift"] = ("biased", "neutral", "neutral")  # absolute shift: mean(m_cond - m_neutral)
         rows = _position_rows(runs, conds, {"neutral": "m_neutral"})
         for r in rows:  # `shift` is only meaningful in log-prob units (its fraction is x/0)
@@ -620,12 +622,17 @@ def analyze_knockout(root: Path, out: Path):
         all_rows[cfg] = rows
         w = next(iter(runs.values()))[0]["window"]
         sfx = "" if cfg == LEGACY_TAG else f"__{cfg}"
-        _plot_positions(rows, [(f"Blocked from block b on", [(f"from_{k}_after", k) for k in keys]),
-                               (f"Blocked in blocks b..b+{w - 1}", [(f"win_{k}_after", k) for k in keys])],
+        if cfg.endswith("__routes"):  # every variant, labelled key <- query
+            panel = lambda win: [(f"{a}_{k}_{q}", f"{q} -/-> {k}") for a, k, q in variants if a == win]
+        else:
+            panel = lambda win: [(f"{win}_{k}_after", k) for k in keys if (win, k, "after") in variants]
+        _plot_positions(rows, [(f"Blocked from block b on", panel("from")),
+                               (f"Blocked in blocks b..b+{w - 1}", panel("win"))],
                         out / f"fig_knockout{sfx}.png", f"{cfg}\nfraction of shift eliminated")
     write_csv(out / "knockout.csv", [x for cfg, rows in sorted(all_rows.items()) for x in _with_config(cfg, rows)])
-    if len(all_rows) > 1:
-        _plot_condition_compare(all_rows, analyze_tracing_rows(root), out / "fig_condition_compare.png")
+    comparable = {c: r for c, r in all_rows.items() if r and "from_span_after_first" in r[0]}
+    if len(comparable) > 1:
+        _plot_condition_compare(comparable, analyze_tracing_rows(root), out / "fig_condition_compare.png")
 
 
 def analyze_tracing_rows(root):

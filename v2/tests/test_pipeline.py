@@ -154,6 +154,18 @@ def test_position_experiments(lm):
     # content-free framing: no answer tokens, the whole sentence is framing
     ide, pe = span_positions(lm, it, "assert_empty_2")  # "I think I know the answer, but I'm really not sure."
     assert pe["answer"] == [] and pe["framing"] == pe["span"] == list(range(4, 15)) and pe["suffix"] == [15, 16], pe
+    # certainty markers before / after the answer
+    _, ph = span_positions(lm, it, "hedge_post")  # ... is Christopher Marlowe, but I'm not sure.
+    assert ph["answer"] == [9, 10] and ph["pre"] == [4, 5, 6, 7, 8] and ph["post"] == [11, 12, 13, 14]
+    assert ph["marker"] == [12, 13, 14], ph
+    _, pp = span_positions(lm, it, "hedge_pre")  # I'm not sure, but I think the answer is Christopher Marlowe.
+    assert pp["marker"] == [4, 5, 6] and pp["post"] == [] and pp["answer"] == [13, 14], pp
+    from v2.positions import AssertItem as AI
+    from v2.run_knockout import variant_possible
+    ai = lambda p_: [AI([0] * 20, [1], [2], p_)]
+    assert not variant_possible(ai(ph), "marker", "answer")   # answer tokens cannot see a later marker
+    assert variant_possible(ai(ph), "marker", "after") and variant_possible(ai(pp), "marker", "answer")
+    assert not variant_possible(ai(pp), "post", "after")     # nothing after the answer
     # resample: x' must be token-aligned and differ only at the answer positions
     pool = ["Ben Jonson", "Paris", "Shakespeare", "Thomas Kyd", "John Webster"]
     ids2 = resample_prefix(lm, it, "assert_plausible", ids, pos, pool, np.random.default_rng(0))
@@ -171,7 +183,7 @@ def test_position_experiments(lm):
                           {"answer": list(range(a0, a1)), "span": list(range(s0, a1 + 1)),
                            "framing": [x for x in range(s0, a1 + 1) if not a0 <= x < a1],
                            "suffix": list(range(a1 + 1, P)), "last": [P - 1],
-                           "after_all": list(range(s0, P))},
+                           "after_all": list(range(s0, P)), "pre": list(range(s0, a0))},
                           corr_prefix=[t if not a0 <= j < a1 else (t + 11) % (VOCAB - 3) + 3
                                        for j, t in enumerate(pre)])
     items = [item(12, 5, 7, 3, 2), item(10, 4, 5, 2, 3), item(12, 6, 8, 4, 1), item(11, 4, 6, 3, 2, 2)]
@@ -196,6 +208,10 @@ def test_position_experiments(lm):
         assert not fm[0, 0, :, x0.pos["answer"]].any(), "framing knockout must not block the answer"
         assert fm[0, 0, x0.pos["suffix"][0], x0.pos["framing"]].all()
         assert not fm[0, 0, :x0.pos["suffix"][0]].any(), "only positions after the assertion are queries"
+        am = blocked(its, range(len(its)), "pre", "answer", T, lm.device)  # tag route: answer -/-> pre
+        x0p = its[0].pos
+        pre0 = [p for p in x0p["framing"] if p < x0p["answer"][0]]
+        assert am[0, 0][x0p["answer"]][:, pre0].all() and int(am[0, 0].sum()) == len(x0p["answer"]) * len(pre0)
         # 'suffix' queries leave answer tokens free: first-token margin identical to 'after'
         bs_ = blocked(its, range(len(its)), "span", "suffix", T, lm.device)
         assert torch.allclose(scores(lm, seqs, all_layers, bs_)[1], a[1], atol=1e-4)
@@ -288,6 +304,15 @@ def test_integration(dataset_path):
         run(run_tracing, "--blocks", "1", "--limit", "8", "--bs", "3", "--condition", "mention_empty_1")
         t0 = json.loads(next((root / "tracing" / "mention_empty_1__noise__s0").glob("block*.json")).read_text())
         assert "answer" not in t0["groups"] and "restore/span" in t0["margins"]
+        # tag vs. gate routes, including a certainty marker after the answer
+        for c in ["assert_plausible", "hedge_post", "hedge_pre"]:
+            run(run_knockout, "--blocks", "1,2", "--limit", "8", "--bs", "3", "--routes", "--condition", c)
+        vr = {c: [tuple(v) for v in json.loads(next((root / "knockout" / f"{c}__routes").glob("block*.json"))
+                                              .read_text())["variants"]]
+              for c in ["assert_plausible", "hedge_post", "hedge_pre"]}
+        assert ("from", "pre", "answer") in vr["assert_plausible"] and ("from", "post", "after") in vr["assert_plausible"]
+        assert ("from", "marker", "after") in vr["hedge_post"] and ("from", "marker", "answer") not in vr["hedge_post"]
+        assert ("from", "marker", "answer") in vr["hedge_pre"] and ("from", "post", "after") not in vr["hedge_pre"]
         from v2 import run_answer_direction
         run(run_answer_direction, "--seeds", "0", "1", "--k", "4")
         ad = json.loads((root / "answer_direction" / "seed0.json").read_text())
@@ -325,7 +350,8 @@ def test_integration(dataset_path):
                                              "assert_plausible__resample", "mention_empty_1__noise"}
         assert {r["n_seeds"] for r in tr if r["config"] == "assert_plausible__noise"} == {"2"}  # s0 + s1 pooled
         ko = list(csv.DictReader(open(root / "analysis" / "knockout.csv")))
-        assert {r["config"] for r in ko} == {"assert_plausible", "mention_plausible_1", "assert_empty_1"}
+        assert {r["config"] for r in ko} == {"assert_plausible", "mention_plausible_1", "assert_empty_1",
+                                             "assert_plausible__routes", "hedge_post__routes", "hedge_pre__routes"}
         assert "shift_first_abs" in ko[0]
         row = next(csv.DictReader(open(root / "analysis" / "main_k4.csv")))
         for col in ["das_iia_seed_sd", "diff_iia_seed_sd", "das_shift_recovered_first", "das_shift_r",
@@ -358,6 +384,7 @@ def test_integration(dataset_path):
                   "fig_knockout__mention_plausible_1.png", "fig_condition_compare.png",
                   "fig_knockout__assert_empty_1.png", "illusion__assert_empty_2.csv",
                   "illusion_reverse__assert_empty_2.csv", "answer_direction.csv",
+                  "fig_knockout__assert_plausible__routes.png", "fig_knockout__hedge_post__routes.png",
                   "rank.csv", "transfer_k4.csv",
                   "subspace_overlap_k4.csv", "fig_probe.png", "table_main_k4.tex"]:
             assert f in produced, f"missing {f}"

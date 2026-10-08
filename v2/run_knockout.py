@@ -17,6 +17,17 @@ drops, and `win` peaks at those blocks.
 --condition (default assert_plausible) selects the prompt; mention conditions test whether a
 mere mention of the answer is read through the same attention pathway (entrainment).
 
+--routes asks HOW the framing strengthens the read of the answer. Two candidate routes:
+  tag  : the answer tokens attend to the framing before them ("I think the answer is") and
+         carry it; the late read then retrieves a "tagged" answer. Test: block
+         answer -> pre (queries = the answer tokens themselves).
+  gate : the positions after the sentence read the framing directly (the early last-token
+         signal) and read the answer more strongly. Test: block after -> pre / post.
+  marker variants do the same for a certainty phrase (config.MARKERS); a marker after the
+  answer can only take the gate route. Variants that cannot occur under causal attention
+  (e.g. answer -> post) or whose positions are empty are dropped per condition. Results
+  go to knockout/<condition>__routes/.
+
 Outputs <results>/<model>/knockout/<condition>/block*.json with per-item margins
 (mean / first / rest); see positions.run_dir for the first run's location.
 """
@@ -39,6 +50,27 @@ KEYS = ["answer", "framing", "span"]
 QUERIES = ["suffix", "after"]
 WINDOWS = ["from", "win"]
 LEGACY_TAG = "assert_plausible"
+ROUTE_VARIANTS = [(w, k, q) for w in WINDOWS
+                  for k, q in [("pre", "answer"), ("pre", "after"), ("post", "after"),
+                               ("marker", "answer"), ("marker", "after")]]
+
+
+def query_positions(it, query, cand_len):
+    if query == "answer":
+        return list(it.pos["answer"])
+    q0 = it.pos["suffix"][0]
+    q1 = len(it.prefix) if query == "suffix" else len(it.prefix) + cand_len
+    return list(range(q0, q1))
+
+
+def variant_possible(items, key, query):
+    """Every item has key and query positions, and some query can attend to some key."""
+    for it in items:
+        k = it.pos[key]
+        qs = query_positions(it, query, 1)
+        if not k or not qs or min(k) >= max(qs):
+            return False
+    return True
 
 
 def blocked(items, idx, key, query, T, device):
@@ -48,10 +80,9 @@ def blocked(items, idx, key, query, T, device):
     for r, i in enumerate(idx):
         it = items[i]
         k = torch.tensor(it.pos[key])  # explicit list: `framing` has a gap where the answer is
-        q0 = it.pos["suffix"][0]
         for j, cand in enumerate((it.c_plus, it.c_minus)):
-            q1 = len(it.prefix) if query == "suffix" else len(it.prefix) + len(cand)
-            m[2 * r + j, 0, q0:q1, k] = True
+            qs = torch.tensor(query_positions(it, query, len(cand)))
+            m[2 * r + j, 0, qs[:, None], k[None, :]] = True
     return m.to(device)
 
 
@@ -95,20 +126,20 @@ def scores(lm, seqs, layers=(), block_mask=None):
         return pair_margins(lm.token_logprobs(seqs))
 
 
-def run_block(lm, items, b, width, bs, keys=KEYS):
+def run_block(lm, items, b, width, bs, variants):
+    """variants: list of (window, key group, query group)."""
     L = lm.n_layers
     windows = {"from": list(range(b, L)), "win": list(range(b, min(b + width, L)))}
-    res = {"biased": [], **{f"{w}/{k}/{q}": [] for w in WINDOWS for k in keys for q in QUERIES}}
+    res = {"biased": [], **{f"{w}/{k}/{q}": [] for w, k, q in variants}}
     for s in range(0, len(items), bs):
         idx = list(range(s, min(s + bs, len(items))))
         seqs = [Seq(items[i].prefix, c) for i in idx for c in (items[i].c_plus, items[i].c_minus)]
         T = max(len(x.prefix) + len(x.cand) for x in seqs)
         res["biased"].append(scores(lm, seqs))
-        for k in keys:
-            for q in QUERIES:
-                bm = blocked(items, idx, k, q, T, lm.device)
-                for w in WINDOWS:
-                    res[f"{w}/{k}/{q}"].append(scores(lm, seqs, windows[w], bm))
+        for k, q in dict.fromkeys((k, q) for _, k, q in variants):
+            bm = blocked(items, idx, k, q, T, lm.device)
+            for w in [w for w, k2, q2 in variants if (k2, q2) == (k, q)]:
+                res[f"{w}/{k}/{q}"].append(scores(lm, seqs, windows[w], bm))
     return {key: {name: torch.cat([p[j] for p in parts]).cpu().numpy().tolist()
                   for j, name in enumerate(["mean", "first", "rest"])}
             for key, parts in res.items()}
@@ -121,6 +152,7 @@ def main():
     ap.add_argument("--blocks", default="all")
     ap.add_argument("--chunk", default=None)
     ap.add_argument("--condition", default="assert_plausible", help="prompt condition with an inserted answer")
+    ap.add_argument("--routes", action="store_true", help="tag vs. gate variants (see docstring)")
     ap.add_argument("--window", type=int, default=4, help="width of the `win` knockout window")
     ap.add_argument("--limit", type=int, default=None, help="first N neutral-correct items only")
     ap.add_argument("--bs", type=int, default=16, help="items per batch (2 sequences each)")
@@ -135,15 +167,21 @@ def main():
 
     lm = LM.load(MODELS[args.model])
     items, rows = assert_items(lm, nc, args.condition)
-    out_dir = run_dir(root, "knockout", args.condition, LEGACY_TAG)
-    # content-free conditions have no answer tokens (and framing == span)
-    keys = [k for k in KEYS if all(it.pos[k] for it in items)]
+    if args.routes:
+        out_dir = root / "knockout" / f"{args.condition}__routes"
+        variants = [v for v in ROUTE_VARIANTS if variant_possible(items, v[1], v[2])]
+    else:
+        out_dir = run_dir(root, "knockout", args.condition, LEGACY_TAG)
+        # content-free conditions have no answer tokens (and framing == span)
+        variants = [(w, k, q) for w in WINDOWS for k in KEYS for q in QUERIES
+                    if variant_possible(items, k, q)]
+    keys = list(dict.fromkeys(k for _, k, _ in variants))
     out_dir.mkdir(parents=True, exist_ok=True)
     blocks = chunk(parse_blocks(args.blocks, lm.n_layers), args.chunk)
     print(f"{args.model} {args.condition}: {len(items)}/{len(nc)} items, window {args.window}, blocks {blocks}")
     sfx = [("mean", ""), ("first", "_first"), ("rest", "_rest")]
     common = {"model": args.model, "condition": args.condition, "rows": rows, "window": args.window,
-              "keys": keys,
+              "keys": keys, "variants": [list(v) for v in variants],
               **{f"m_neutral{s}": neu[p][rows].tolist() for p, s in sfx},
               **{f"m_biased_behavior{s}": bia[p][rows].tolist() for p, s in sfx}}
     mn = np.array(common["m_neutral_first"])
@@ -151,11 +189,11 @@ def main():
         f = out_dir / f"block{b:02d}.json"
         if f.exists():
             continue
-        res = run_block(lm, items, b, args.window, args.bs, keys)
+        res = run_block(lm, items, b, args.window, args.bs, variants)
         write_json(f, {**common, "block": b, "margins": res})
         mb = np.array(res["biased"]["first"])
         msg = [f"{w}/{k}/{q}={np.mean(np.array(res[f'{w}/{k}/{q}']['first']) - mb) / np.mean(mn - mb):+.2f}"
-               for w in WINDOWS for k in keys for q in QUERIES if q == "suffix"]
+               for w, k, q in variants if q != "after" or args.routes]
         print(f"block {b:2d} (first token, eliminated): " + "  ".join(msg))
 
 

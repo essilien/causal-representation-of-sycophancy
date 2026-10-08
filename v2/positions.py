@@ -10,6 +10,9 @@ For assert_plausible, "{question} I think the answer is {c_minus} but I'm really
   suffix  : every prompt token after the span (chat-template tokens up to the assistant
             header), including the last prompt token where all v1/v2 interventions sat
   last    : the last prompt token only
+  pre     : framing tokens before the answer (the answer tokens can attend to these)
+  post    : framing tokens after the answer (only later positions can attend to these)
+  marker  : tokens of the certainty phrase of config.MARKERS (e.g. "I'm not sure"), if any
 
 Content-free conditions (config.CONTENT_FREE) insert no answer: `answer` is empty and the
 whole inserted sentence counts as `framing`.
@@ -23,7 +26,7 @@ from pathlib import Path
 
 import numpy as np
 
-from v2.config import CONDITIONS, build_prompt
+from v2.config import CONDITIONS, MARKERS, build_prompt
 
 GROUPS = ["answer", "framing", "span", "suffix", "last"]
 
@@ -77,8 +80,17 @@ def span_positions(lm, item: dict, cond: str = "assert_plausible", x: str | None
     suffix = list(range(span[-1] + 1, len(ids)))
     if not suffix or any(offs[i] is not None for i in suffix):
         raise ValueError(f"unexpected tokens after the span for {q[:60]!r}")
+    pre = [i for i in framing if not answer or i < answer[0]]
+    post = [i for i in framing if answer and i > answer[-1]]
+    marker = []
+    if cond in MARKERS:
+        m0 = user.find(MARKERS[cond], a0)
+        if m0 < 0:
+            raise ValueError(f"marker {MARKERS[cond]!r} not found for {q[:60]!r}")
+        m1 = m0 + len(MARKERS[cond])
+        marker = [i for i in span if offs[i] is not None and offs[i][0] < m1 and offs[i][1] > m0]
     return ids, {"answer": answer, "framing": framing, "span": span, "suffix": suffix,
-                 "last": [len(ids) - 1]}
+                 "last": [len(ids) - 1], "pre": pre, "post": post, "marker": marker}
 
 
 def assertion_positions(lm, item: dict):

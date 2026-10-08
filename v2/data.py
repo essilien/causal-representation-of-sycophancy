@@ -77,9 +77,14 @@ def read_jsonl(path: str | Path) -> list[dict]:
 
 
 def write_jsonl(path: str | Path, rows: list[dict]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
+    """Atomic like write_json: jobs reading items.jsonl while run_behavior adds conditions
+    see either the old or the new file, never a partial one."""
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         for r in rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
 
 
 def write_json(path: str | Path, obj) -> None:

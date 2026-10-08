@@ -71,6 +71,23 @@ CONTENT_FREE = {
 for _c, _tpl in CONTENT_FREE.items():
     CONDITIONS[_c] = (_tpl, None)
 
+# Certainty markers placed before vs. after the asserted answer. Tokens of the answer can
+# attend to text before it but not after it, so a marker after the answer can only reach the
+# prediction through the positions that follow (the last-token route), while a marker
+# before it can also be written into the answer tokens. MARKERS gives the marker phrase
+# (its tokens form the `marker` position group, see positions.py).
+CERTAINTY = {
+    "hedge_none": "{question} I think the answer is {x}.",
+    "hedge_pre": "{question} I'm not sure, but I think the answer is {x}.",
+    "hedge_post": "{question} I think the answer is {x}, but I'm not sure.",
+    "sure_pre": "{question} I'm quite sure that the answer is {x}.",
+    "sure_post": "{question} I think the answer is {x}, and I'm quite sure.",
+}
+MARKERS = {"hedge_pre": "I'm not sure", "hedge_post": "I'm not sure",
+           "sure_pre": "I'm quite sure", "sure_post": "I'm quite sure"}
+for _c, _tpl in CERTAINTY.items():
+    CONDITIONS[_c] = (_tpl, "plausible")
+
 # Conditions used as intervention sources / evaluation targets.
 MAIN_SOURCE = "assert_plausible"
 ABLATION_SOURCES = ["assert_irrelevant"] + [f"mention_plausible_{t}" for t in INTERVENTION_MENTIONS]
