@@ -14,7 +14,11 @@ m_biased the unintervened run of the same prompt and m_neutral from the behavior
 Prediction if the assertion is read late: `from` stays near 1 up to a late block and then
 drops, and `win` peaks at those blocks.
 
-Outputs <results>/<model>/knockout/block*.json with per-item margins (mean / first / rest).
+--condition (default assert_plausible) selects the prompt; mention conditions test whether a
+mere mention of the answer is read through the same attention pathway (entrainment).
+
+Outputs <results>/<model>/knockout/<condition>/block*.json with per-item margins
+(mean / first / rest); see positions.run_dir for the first run's location.
 """
 import argparse
 import json
@@ -28,12 +32,13 @@ from v2.config import MODELS
 from v2.das import pair_margins
 from v2.data import read_jsonl, write_json
 from v2.lm import LM, Seq
-from v2.positions import assert_items
+from v2.positions import assert_items, run_dir
 from v2.run_intervention import chunk, parse_blocks, per_token_margins
 
 KEYS = ["answer", "framing", "span"]
 QUERIES = ["suffix", "after"]
 WINDOWS = ["from", "win"]
+LEGACY_TAG = "assert_plausible"
 
 
 def blocked(items, idx, key, query, T, device):
@@ -115,6 +120,7 @@ def main():
     ap.add_argument("--results-root", required=True)
     ap.add_argument("--blocks", default="all")
     ap.add_argument("--chunk", default=None)
+    ap.add_argument("--condition", default="assert_plausible", help="prompt condition with an inserted answer")
     ap.add_argument("--window", type=int, default=4, help="width of the `win` knockout window")
     ap.add_argument("--limit", type=int, default=None, help="first N neutral-correct items only")
     ap.add_argument("--bs", type=int, default=16, help="items per batch (2 sequences each)")
@@ -125,16 +131,16 @@ def main():
     meta = json.loads((beh / "meta.json").read_text())
     items_all = read_jsonl(beh / "items.jsonl")
     nc = [items_all[i] for i in meta["nc_ids"]][:args.limit]
-    neu, bia = per_token_margins(nc, "neutral"), per_token_margins(nc, "assert_plausible")
+    neu, bia = per_token_margins(nc, "neutral"), per_token_margins(nc, args.condition)
 
     lm = LM.load(MODELS[args.model])
-    items, rows = assert_items(lm, nc)
-    out_dir = root / "knockout"
+    items, rows = assert_items(lm, nc, args.condition)
+    out_dir = run_dir(root, "knockout", args.condition, LEGACY_TAG)
     out_dir.mkdir(parents=True, exist_ok=True)
     blocks = chunk(parse_blocks(args.blocks, lm.n_layers), args.chunk)
-    print(f"{args.model}: {len(items)}/{len(nc)} items, window {args.window}, blocks {blocks}")
+    print(f"{args.model} {args.condition}: {len(items)}/{len(nc)} items, window {args.window}, blocks {blocks}")
     sfx = [("mean", ""), ("first", "_first"), ("rest", "_rest")]
-    common = {"model": args.model, "rows": rows, "window": args.window,
+    common = {"model": args.model, "condition": args.condition, "rows": rows, "window": args.window,
               **{f"m_neutral{s}": neu[p][rows].tolist() for p, s in sfx},
               **{f"m_biased_behavior{s}": bia[p][rows].tolist() for p, s in sfx}}
     mn = np.array(common["m_neutral_first"])

@@ -432,12 +432,22 @@ def init_check(root: Path, runs, blocks, k):
 
 
 def analyze_illusion(root: Path, out: Path):
-    """Shift recovered (vs. each item's own true shift) when the trained W is fed sources that
-    should not reproduce it. See v2/run_illusion_control.py."""
-    files = sorted((root / "illusion").glob("seed*/block*.json"))
-    if not files:
+    """Trained W fed sources that should not reproduce the item's shift (forward), and the
+    necessity test (reverse: biased base, subspace set to a non-biased source). See
+    v2/run_illusion_control.py. Both store m_int / m_src (aim) / m_neutral (base run)."""
+    found = False
+    for folder, name, ylabel in [("illusion", "illusion", "First-token shift recovered\n(relative to item's own shift)"),
+                                 ("illusion_reverse", "illusion_reverse", "First-token shift removed\n(relative to item's own shift)")]:
+        files = sorted((root / folder).glob("seed*/block*.json"))
+        if not files:
+            continue
+        found = True
+        _illusion_dir(files, out, name, ylabel)
+    if not found:
         print("  illusion: no results yet")
-        return
+
+
+def _illusion_dir(files, out, name, ylabel):
     runs = defaultdict(list)
     for f in files:
         r = json.loads(f.read_text())
@@ -451,7 +461,7 @@ def analyze_illusion(root: Path, out: Path):
                       np.array(r[f"m_neutral{part}"])) for r in rs]
                 (row[f"{c}{sfx}"], row[f"{c}{sfx}_lo"], row[f"{c}{sfx}_hi"], _) = boot(t, v_rec)
         rows.append(row)
-    write_csv(out / "illusion.csv", rows)
+    write_csv(out / f"{name}.csv", rows)
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -461,7 +471,7 @@ def analyze_illusion(root: Path, out: Path):
         rr = [r for r in rows if r["method"] == method]
         x = [r["block"] for r in rr]
         for c, ls in styles.items():
-            if f"{c}_first" not in rr[0]:
+            if not rr or f"{c}_first" not in rr[0]:
                 continue
             ax.plot(x, [r[f"{c}_first"] for r in rr], ls, marker="o", ms=2.5, label=c.replace("_", " "))
             ax.fill_between(x, [r[f"{c}_first_lo"] for r in rr], [r[f"{c}_first_hi"] for r in rr], alpha=0.12, lw=0)
@@ -469,35 +479,43 @@ def analyze_illusion(root: Path, out: Path):
         ax.set_title({"das": "DAS (k=64)", "patch": "Full patching"}[method] + ": source")
         ax.set_xlabel("Decoder block")
         ax.grid(alpha=0.3)
-    axes[0].set_ylabel("First-token shift recovered\n(relative to item's own shift)")
+    axes[0].set_ylabel(ylabel)
     axes[0].legend(fontsize=7)
     fig.tight_layout()
-    fig.savefig(out / "fig_illusion.png", dpi=200)
+    fig.savefig(out / f"fig_{name}.png", dpi=200)
     plt.close(fig)
-    print(f"  wrote {out / 'fig_illusion.png'}")
+    print(f"  wrote {out / f'fig_{name}.png'}")
 
 
-def _position_rows(files, conditions, ref):
-    """One row per block: for each condition, the fraction v_rec(m_cond, m_target, m_base)
-    with item-bootstrap CI, per margin part. `conditions` maps a column name to
-    (condition key, target, base), where target/base name a run in `margins` or a stored
-    reference array (`ref` maps names to the JSON fields)."""
+def v_abs(mi, ms, mn):
+    """Absolute counterpart of v_rec: mean margin change in log-prob units."""
+    return (mi - mn).mean(-1)
+
+
+def _position_rows(runs, conditions, ref):
+    """runs: block -> list of result dicts (one per seed / noise draw). One row per block:
+    for each column, v_rec(m_cond, m_target, m_base) and its absolute counterpart with
+    item-bootstrap CIs (seeds averaged, see boot), per margin part. `conditions` maps a
+    column to (condition key, target, base), where target/base name a run in `margins` or
+    a stored reference array (`ref` maps names to JSON fields)."""
     rows = []
-    for f in files:
-        r = json.loads(f.read_text())
-        mg = r["margins"]
+    for b in sorted(runs):
+        rs = runs[b]
 
-        def arr(name, part):
+        def arr(r, name, part):
             sfx = "" if part == "mean" else f"_{part}"
-            return np.array(r[ref[name] + sfx] if name in ref else mg[name][part], dtype=float)
-        row = {"block": r["block"], "n_items": len(r["rows"])}
+            return np.array(r[ref[name] + sfx] if name in ref else r["margins"][name][part], dtype=float)
+        row = {"block": b, "n_items": len(rs[0]["rows"]), "n_seeds": len(rs)}
         for col, (cond, target, base) in conditions.items():
             for part in ["mean", "first", "rest"]:
-                t = [arr(cond, part), arr(target, part), arr(base, part)]
-                ok = np.all([np.isfinite(x) for x in t], axis=0)
-                pt, lo, hi, _ = boot([tuple(x[ok] for x in t)], v_rec)
+                ts = []
+                for r in rs:
+                    t = [arr(r, cond, part), arr(r, target, part), arr(r, base, part)]
+                    ok = np.all([np.isfinite(x) for x in t], axis=0)
+                    ts.append(tuple(x[ok] for x in t))
                 sfx = "" if part == "mean" else f"_{part}"
-                row[f"{col}{sfx}"], row[f"{col}{sfx}_lo"], row[f"{col}{sfx}_hi"] = pt, lo, hi
+                row[f"{col}{sfx}"], row[f"{col}{sfx}_lo"], row[f"{col}{sfx}_hi"], _ = boot(ts, v_rec)
+                row[f"{col}{sfx}_abs"], row[f"{col}{sfx}_abs_lo"], row[f"{col}{sfx}_abs_hi"], _ = boot(ts, v_abs)
         rows.append(row)
     return rows
 
@@ -531,40 +549,116 @@ def _plot_positions(rows, panels, path, ylabel):
     print(f"  wrote {path}")
 
 
+def _load_position_runs(root, kind, legacy_tag, config_of):
+    """config -> block -> [result dicts]; `config_of(tag)` drops the seed from a run tag so
+    repeated draws of one configuration are pooled."""
+    from v2.positions import run_dirs
+    out = defaultdict(lambda: defaultdict(list))
+    for tag, d in run_dirs(root, kind, legacy_tag).items():
+        for f in sorted(d.glob("block*.json")):
+            r = json.loads(f.read_text())
+            out[config_of(tag)][r["block"]].append(r)
+    return out
+
+
+def _with_config(config, rows):
+    return [{"config": config, **r} for r in rows]
+
+
 def analyze_tracing(root: Path, out: Path):
     """Causal tracing (v2/run_tracing.py): fraction of the clean-vs-corrupted margin
-    difference restored / removed by setting one (block, position group)."""
-    files = sorted((root / "tracing").glob("block*.json"))
-    if not files:
+    difference restored / removed by setting one (block, position group), per
+    configuration <condition>__<corruption>, pooling seeds."""
+    from v2.run_tracing import LEGACY_TAG
+    configs = _load_position_runs(root, "tracing", LEGACY_TAG, lambda t: t.rsplit("__s", 1)[0])
+    if not configs:
         print("  tracing: no results yet")
         return
-    groups = json.loads(files[0].read_text())["groups"]
-    conds = {"corruption_strength": ("corr", "neutral", "clean")}
-    conds |= {f"restore_{g}": (f"restore/{g}", "clean", "corr") for g in groups}
-    conds |= {f"remove_{g}": (f"remove/{g}", "corr", "clean") for g in groups}
-    rows = _position_rows(files, conds, {"neutral": "m_neutral"})
-    write_csv(out / "tracing.csv", rows)
-    _plot_positions(rows, [("Restore clean state (sufficiency)", [(f"restore_{g}", g) for g in groups]),
-                           ("Remove: insert corrupted state (necessity)", [(f"remove_{g}", g) for g in groups])],
-                    out / "fig_tracing.png", "Fraction of clean-corrupted\nmargin difference")
+    all_rows = {}
+    for cfg, runs in sorted(configs.items()):
+        groups = next(iter(runs.values()))[0]["groups"]
+        conds = {"corruption_strength": ("corr", "neutral", "clean")}
+        conds |= {f"restore_{g}": (f"restore/{g}", "clean", "corr") for g in groups}
+        conds |= {f"remove_{g}": (f"remove/{g}", "corr", "clean") for g in groups}
+        rows = _position_rows(runs, conds, {"neutral": "m_neutral"})
+        all_rows[cfg] = rows
+        sfx = "" if cfg == LEGACY_TAG.rsplit("__s", 1)[0] else f"__{cfg}"
+        _plot_positions(rows, [(f"Restore clean state (sufficiency)", [(f"restore_{g}", g) for g in groups]),
+                               (f"Remove: insert corrupted state (necessity)", [(f"remove_{g}", g) for g in groups])],
+                        out / f"fig_tracing{sfx}.png", f"{cfg}\nfraction of clean-corrupted diff.")
+    write_csv(out / "tracing.csv", [x for cfg, rows in sorted(all_rows.items()) for x in _with_config(cfg, rows)])
+    return all_rows
 
 
 def analyze_knockout(root: Path, out: Path):
-    """Attention knockout (v2/run_knockout.py): fraction of the sycophantic shift
-    (biased - neutral margin) eliminated when later positions cannot attend to the
-    assertion in a window of blocks."""
-    from v2.run_knockout import KEYS, QUERIES, WINDOWS
-    files = sorted((root / "knockout").glob("block*.json"))
-    if not files:
+    """Attention knockout (v2/run_knockout.py): fraction (and absolute log-prob amount) of
+    the shift (condition - neutral margin) eliminated when later positions cannot attend to
+    the inserted text in a window of blocks, per condition."""
+    from v2.run_knockout import KEYS, LEGACY_TAG, QUERIES, WINDOWS
+    configs = _load_position_runs(root, "knockout", LEGACY_TAG, lambda t: t)
+    if not configs:
         print("  knockout: no results yet")
         return
-    conds = {f"{w}_{k}_{q}": (f"{w}/{k}/{q}", "neutral", "biased") for w in WINDOWS for k in KEYS for q in QUERIES}
-    rows = _position_rows(files, conds, {"neutral": "m_neutral"})
-    write_csv(out / "knockout.csv", rows)
-    w = json.loads(files[0].read_text())["window"]
-    _plot_positions(rows, [(f"Blocked from block b on", [(f"from_{k}_after", k) for k in KEYS]),
-                           (f"Blocked in blocks b..b+{w - 1}", [(f"win_{k}_after", k) for k in KEYS])],
-                    out / "fig_knockout.png", "Fraction of sycophantic\nshift eliminated")
+    all_rows = {}
+    for cfg, runs in sorted(configs.items()):
+        conds = {f"{w}_{k}_{q}": (f"{w}/{k}/{q}", "neutral", "biased")
+                 for w in WINDOWS for k in KEYS for q in QUERIES}
+        conds["shift"] = ("biased", "neutral", "neutral")  # absolute shift: mean(m_cond - m_neutral)
+        rows = _position_rows(runs, conds, {"neutral": "m_neutral"})
+        for r in rows:  # `shift` is only meaningful in log-prob units (its fraction is x/0)
+            for k in [k for k in r if k.startswith("shift") and "_abs" not in k]:
+                del r[k]
+        all_rows[cfg] = rows
+        w = next(iter(runs.values()))[0]["window"]
+        sfx = "" if cfg == LEGACY_TAG else f"__{cfg}"
+        _plot_positions(rows, [(f"Blocked from block b on", [(f"from_{k}_after", k) for k in KEYS]),
+                               (f"Blocked in blocks b..b+{w - 1}", [(f"win_{k}_after", k) for k in KEYS])],
+                        out / f"fig_knockout{sfx}.png", f"{cfg}\nfraction of shift eliminated")
+    write_csv(out / "knockout.csv", [x for cfg, rows in sorted(all_rows.items()) for x in _with_config(cfg, rows)])
+    if len(all_rows) > 1:
+        _plot_condition_compare(all_rows, analyze_tracing_rows(root), out / "fig_condition_compare.png")
+
+
+def analyze_tracing_rows(root):
+    """Noise-tracing rows per condition (seeds pooled), without writing files."""
+    from v2.run_tracing import LEGACY_TAG
+    configs = _load_position_runs(root, "tracing", LEGACY_TAG, lambda t: t.rsplit("__s", 1)[0])
+    out = {}
+    for cfg, runs in configs.items():
+        cond, corruption = cfg.split("__")
+        if corruption == "noise":
+            out[cond] = _position_rows(runs, {"restore_last": ("restore/last", "clean", "corr"),
+                                              "restore_answer": ("restore/answer", "clean", "corr")},
+                                       {"neutral": "m_neutral"})
+    return out
+
+
+def _plot_condition_compare(ko, tr, path):
+    """Is the late read of the inserted answer specific to assertions? One line per
+    condition: knockout from block b (first token; fraction and log-prob units) and, if
+    available, noise tracing of the last token."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    panels = [("Knockout from block b: fraction of shift eliminated", ko, "from_span_after_first", False),
+              ("Knockout from block b: log-prob eliminated", ko, "from_span_after_first_abs", False),
+              ("Tracing: restore last token (fraction)", tr, "restore_last_first", True)]
+    panels = [p for p in panels if p[1]]
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.4 * len(panels), 3.4), squeeze=False)
+    for ax, (title, data, col, _) in zip(axes[0], panels):
+        for cfg, rows in sorted(data.items()):
+            x = [r["block"] for r in rows]
+            ax.plot(x, [r[col] for r in rows], marker="o", ms=2.5, label=cfg)
+            ax.fill_between(x, [r[col + "_lo"] for r in rows], [r[col + "_hi"] for r in rows], alpha=0.12, lw=0)
+        ax.axhline(0, color="k", lw=0.8)
+        ax.set_title(title, fontsize=9)
+        ax.set_xlabel("Decoder block")
+        ax.grid(alpha=0.3)
+    axes[0, 0].legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"  wrote {path}")
 
 
 def analyze_probe(root: Path, out: Path):

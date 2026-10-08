@@ -3,10 +3,14 @@ Position-resolved causal tracing (Meng et al., 2022) of the assertion inside the
 prompt. All v1/v2 interventions sat at the last prompt token; this asks WHERE in the prompt,
 and from which block on, the information that drives the sycophantic shift is carried.
 
-Runs are on the assert_plausible prompt, so every position exists in both runs:
-  clean     : the prompt as is (shows the sycophantic shift)
-  corrupted : Gaussian noise added to the input embeddings of the whole assertion span
-              (scale = --noise-mult x std of the span-token embeddings), which removes it
+Runs are on the prompt of --condition (default assert_plausible), so every position exists
+in both runs:
+  clean     : the prompt as is (shows the shift)
+  corrupted : --corruption noise: Gaussian noise added to the input embeddings of the whole
+              inserted span (scale = --noise-mult x std of the span-token embeddings)
+              --corruption resample: the inserted answer x replaced by another item's answer
+              x' with the same token count, all other tokens unchanged (symmetric token
+              replacement; removes only the answer CONTENT, keeps the framing)
 For each block b and position group G (see v2/positions.py):
   restore : corrupted run, but the output of block b at G is set to its clean value.
             Fraction restored = (m - m_corr) / (m_clean - m_corr): is the state at (b, G)
@@ -17,7 +21,11 @@ For each block b and position group G (see v2/positions.py):
 Prediction if the assertion is read late from the context: `last`/`suffix` matter only at
 late blocks, while `span` (or `answer`) carries the effect through the middle blocks.
 
-Outputs <results>/<model>/tracing/block*.json with per-item margins (mean / first / rest).
+Conditions other than assert_plausible (e.g. mention_plausible_1) test whether the same
+pathway carries a mere mention of the answer, i.e. contextual entrainment.
+
+Outputs <results>/<model>/tracing/<condition>__<corruption>__s<seed>/block*.json with
+per-item margins (mean / first / rest); see positions.run_dir for the first run's location.
 """
 import argparse
 import json
@@ -31,10 +39,11 @@ from v2.config import MODELS
 from v2.das import pair_margins
 from v2.data import read_jsonl, write_json
 from v2.lm import LM, Seq
-from v2.positions import GROUPS, assert_items
+from v2.positions import GROUPS, assert_items, run_dir
 from v2.run_intervention import chunk, parse_blocks, per_token_margins
 
 DIRECTIONS = ["restore", "remove"]
+LEGACY_TAG = "assert_plausible__noise__s0"
 
 
 @contextmanager
@@ -103,7 +112,7 @@ def pair_index(items, idx, group, where, device):
             torch.tensor(sel, device=device))
 
 
-def run_block(lm, items, b, groups, scale, seed, bs):
+def run_block(lm, items, b, groups, scale, seed, bs, corruption="noise"):
     """Margins for every item: clean, corrupted, and each (direction, group)."""
     dev = lm.device
     res = {"clean": [], "corr": [], **{f"{d}/{g}": [] for d in DIRECTIONS for g in groups}}
@@ -111,11 +120,17 @@ def run_block(lm, items, b, groups, scale, seed, bs):
         idx = list(range(s, min(s + bs, len(items))))
         prefixes = [items[i].prefix for i in idx]
         seqs = [Seq(items[i].prefix, c) for i in idx for c in (items[i].c_plus, items[i].c_minus)]
-        nr, nc_, nz = noise_for(items, idx, lm.d_model, scale, seed, dev)
-        # the same noise for the paired (c_plus, c_minus) sequences
-        pr, pc = 2 * nr, nc_
-        pair_noise = (torch.cat([pr, pr + 1]), torch.cat([pc, pc]), torch.cat([nz, nz]))
-        prompt_noise = (nr, nc_, nz)
+        if corruption == "noise":
+            nr, nc_, nz = noise_for(items, idx, lm.d_model, scale, seed, dev)
+            # the same noise for the paired (c_plus, c_minus) sequences
+            pr, pc = 2 * nr, nc_
+            pair_noise = (torch.cat([pr, pr + 1]), torch.cat([pc, pc]), torch.cat([nz, nz]))
+            prompt_noise = (nr, nc_, nz)
+            corr_prefixes, corr_seqs = prefixes, seqs
+        else:  # resample: a different, token-aligned prompt; no noise
+            pair_noise = prompt_noise = (None, None, None)
+            corr_prefixes = [items[i].corr_prefix for i in idx]
+            corr_seqs = [Seq(items[i].corr_prefix, c) for i in idx for c in (items[i].c_plus, items[i].c_minus)]
         # recorded prompt states of block b at every position of every group
         rec_rows, rec_cols, where = [], [], {}
         for r, i in enumerate(idx):
@@ -125,16 +140,16 @@ def run_block(lm, items, b, groups, scale, seed, bs):
                 rec_cols.append(p)
         rr, rc = torch.tensor(rec_rows, device=dev), torch.tensor(rec_cols, device=dev)
         states = {"clean": record(lm, prefixes, b, rr, rc, (None, None, None)),
-                  "corr": record(lm, prefixes, b, rr, rc, prompt_noise)}
+                  "corr": record(lm, corr_prefixes, b, rr, rc, prompt_noise)}
         with torch.no_grad():
             res["clean"].append(pair_margins(lm.token_logprobs(seqs)))
             with embed_noise(lm, *pair_noise):
-                res["corr"].append(pair_margins(lm.token_logprobs(seqs)))
+                res["corr"].append(pair_margins(lm.token_logprobs(corr_seqs)))
             for g in groups:
                 rows, cols, sel = pair_index(items, idx, g, where, dev)
                 with embed_noise(lm, *pair_noise):  # restore: corrupted run, clean state at (b, G)
                     res[f"restore/{g}"].append(pair_margins(
-                        lm.token_logprobs(seqs, b, set_fn(rows, cols, states["clean"][sel]))))
+                        lm.token_logprobs(corr_seqs, b, set_fn(rows, cols, states["clean"][sel]))))
                 res[f"remove/{g}"].append(pair_margins(  # remove: clean run, corrupted state
                     lm.token_logprobs(seqs, b, set_fn(rows, cols, states["corr"][sel]))))
     out = {}
@@ -157,10 +172,12 @@ def main():
     ap.add_argument("--blocks", default="all")
     ap.add_argument("--chunk", default=None)
     ap.add_argument("--groups", nargs="+", default=GROUPS, choices=GROUPS)
+    ap.add_argument("--condition", default="assert_plausible", help="prompt condition with an inserted answer")
+    ap.add_argument("--corruption", choices=["noise", "resample"], default="noise")
     ap.add_argument("--noise-mult", type=float, default=3.0)
     ap.add_argument("--limit", type=int, default=None, help="first N neutral-correct items only")
     ap.add_argument("--bs", type=int, default=16, help="items per batch (2 sequences each)")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0, help="noise draw / resample choice")
     args = ap.parse_args()
 
     root = Path(args.results_root) / args.model
@@ -168,16 +185,19 @@ def main():
     meta = json.loads((beh / "meta.json").read_text())
     items_all = read_jsonl(beh / "items.jsonl")
     nc = [items_all[i] for i in meta["nc_ids"]][:args.limit]
-    neu, bia = per_token_margins(nc, "neutral"), per_token_margins(nc, "assert_plausible")
+    neu, bia = per_token_margins(nc, "neutral"), per_token_margins(nc, args.condition)
 
     lm = LM.load(MODELS[args.model])
-    items, rows = assert_items(lm, nc)
+    resample = args.corruption == "resample"
+    items, rows = assert_items(lm, nc, args.condition, resample_seed=args.seed if resample else None)
     scale = noise_scale(lm, items, args.noise_mult)
-    out_dir = root / "tracing"
+    tag = f"{args.condition}__{args.corruption}__s{args.seed}"
+    out_dir = run_dir(root, "tracing", tag, LEGACY_TAG)
     out_dir.mkdir(parents=True, exist_ok=True)
     blocks = chunk(parse_blocks(args.blocks, lm.n_layers), args.chunk)
-    print(f"{args.model}: {len(items)}/{len(nc)} items, noise scale {scale:.4f}, blocks {blocks}")
-    common = {"model": args.model, "rows": rows, "noise_scale": scale, "noise_mult": args.noise_mult,
+    print(f"{args.model} {tag}: {len(items)}/{len(nc)} items, noise scale {scale:.4f}, blocks {blocks}")
+    common = {"model": args.model, "condition": args.condition, "corruption": args.corruption,
+              "rows": rows, "noise_scale": scale, "noise_mult": args.noise_mult,
               "seed": args.seed, "groups": args.groups,
               **{f"m_neutral{s}": neu[p][rows].tolist() for p, s in [("mean", ""), ("first", "_first"), ("rest", "_rest")]},
               **{f"m_biased_behavior{s}": bia[p][rows].tolist() for p, s in [("mean", ""), ("first", "_first"), ("rest", "_rest")]}}
@@ -185,7 +205,7 @@ def main():
         f = out_dir / f"block{b:02d}.json"
         if f.exists():
             continue
-        res = run_block(lm, items, b, args.groups, scale, args.seed, args.bs)
+        res = run_block(lm, items, b, args.groups, scale, args.seed, args.bs, args.corruption)
         write_json(f, {**common, "block": b, "margins": res})
         cl, co = np.array(res["clean"]["first"]), np.array(res["corr"]["first"])
         msg = [f"corr removes {np.mean(co - cl) / np.mean(np.array(common['m_neutral_first']) - cl):+.2f} of shift"]

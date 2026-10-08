@@ -12,6 +12,7 @@ v1 code (`common/`, `phase*/`, `controls/`) is untouched and not imported.
 | E5 | Generalization | Same pipeline with `MODEL=qwen` (Qwen2.5-7B-Instruct). |
 | E6 | Where in the prompt is the assertion carried, and from which block on? | `run_tracing.py`: causal tracing inside the biased prompt. The assertion span's input embeddings are noised, then the clean state of one (block, position group) is restored, or in the other direction the corrupted state is inserted into the clean run. Groups: asserted answer, framing, whole span, post-assertion template tokens, last token. `fig_tracing.png` |
 | E7 | Is the shift read from the assertion via attention, and at which depth? | `run_knockout.py`: positions after the assertion cannot attend to the answer / framing / span, in blocks b..L−1 or in a sliding window of 4 blocks. `fig_knockout.png` |
+| E8 | Is the late read sycophancy or entrainment? Are E6/E7 robust? Is the DAS subspace necessary? | E6/E7 rerun with `mention_plausible_1/2` and `assert_irrelevant` prompts (`fig_condition_compare.png`), two more noise draws, and a noise-free corruption that swaps the asserted answer for a token-aligned other answer (`--corruption resample`). `run_illusion_control --direction reverse`: the trained subspace is set to the neutral value in the biased run; an illusory subspace is sufficient but not necessary (`fig_illusion_reverse.png`). All submitted by `submit_mechanism.sh` |
 | (limitation 1) | Is late-layer patching just "copying the output"? | Every intervention logs the margin on the first answer token and on tokens 2..k separately; `analyze` reports the shift recovered on each (`fig_first_vs_rest_k64.png`). If the late-layer patching advantage vanishes on tokens 2..k, it is carried by the token read directly off the patched position. |
 
 ## Changes from v1
@@ -40,13 +41,14 @@ E6/E7 need only the behavior stage and run separately (about 1 GPU-hour each, as
 ```bash
 sbatch --mail-user="$SYCO_MAIL" --export=ALL,MODEL=llama v2/slurm/tracing.sbatch
 sbatch --mail-user="$SYCO_MAIL" --export=ALL,MODEL=llama v2/slurm/knockout.sbatch
+bash v2/slurm/submit_mechanism.sh llama   # E8: 10 jobs + a final analysis job that mails once
 ```
 
 Results go to `$(ws_find syco)/results/<model>/`:
 - `behavior/`: items, scores, activation cache
 - `probe.json`
 - `calibrate/`, `main/`, `rank/`, `ablation/`: one JSON per seed, block, method and rank, plus the trained W
-- `illusion/`, `tracing/`, `knockout/`: one JSON per block with per-item margins
+- `illusion/`, `illusion_reverse/`, `tracing/<condition>__<corruption>__s<seed>/`, `knockout/<condition>/`: one JSON per block with per-item margins (the first assert_plausible E6/E7 runs sit directly in `tracing/` and `knockout/`)
 - `analysis/`: CSV, LaTeX and PNG outputs
 
 Finished outputs are skipped on rerun, so a job that timed out can simply be resubmitted.

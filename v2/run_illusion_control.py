@@ -16,8 +16,20 @@ on the test split with sources that should NOT reproduce the item's shift:
                       means W only encodes "push toward c_minus" relative to this base.
 Full patching is evaluated with the same sources as a reference.
 
-Outputs <results>/<model>/illusion/seed*/block*__{das,patch}.json with per-item margins
-(mean-token and first-token) per source; `python -m v2.analyze --only illusion` summarizes.
+--direction reverse is the NECESSITY test (Makelov et al.: an illusory subspace is sufficient
+when patched in but not necessary). Base = the BIASED prompt, and the subspace (or the full
+vector) is set to a non-biased source. Fraction removed = (m_int - m_biased) /
+(m_neutral - m_biased):
+  matched       : the item's own NEUTRAL representation (does removing the subspace
+                  component remove the shift?)
+  other_neutral : another item's neutral representation (is what is removed item-specific?)
+  other_biased  : another item's biased representation (should remove only the
+                  item-specific part)
+
+Outputs <results>/<model>/illusion[_reverse]/seed*/block*__{das,patch}.json with per-item
+margins (mean-token and first-token) per source, stored as m_int, m_src (the margin the
+intervention aims at) and m_neutral (the base run's margin; for reverse: the biased run);
+`python -m v2.analyze --only illusion` summarizes both directions.
 
 Usage:
     python -m v2.run_illusion_control --model llama --results-root $SYCO_RESULTS
@@ -46,9 +58,10 @@ def derangement(n: int, rng) -> np.ndarray:
     return perm
 
 
-def control_sources(src_biased, src_neutral, test, perm):
-    """Source arrays aligned with item rows; only test rows are replaced."""
-    out = {"matched": src_biased}
+def control_sources(src_biased, src_neutral, test, perm, reverse=False):
+    """Source arrays aligned with item rows; only test rows are replaced. `matched` is the
+    item's own biased (forward) or neutral (reverse) representation."""
+    out = {"matched": src_neutral if reverse else src_biased}
     ob = src_biased.copy()
     ob[test] = src_biased[test[perm]]
     on = src_neutral.copy()
@@ -67,7 +80,9 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     ap.add_argument("--blocks", default="all")
     ap.add_argument("--chunk", default=None)
+    ap.add_argument("--direction", choices=["forward", "reverse"], default="forward")
     args = ap.parse_args()
+    reverse = args.direction == "reverse"
 
     root = Path(args.results_root) / args.model
     beh = root / "behavior"
@@ -79,14 +94,15 @@ def main():
     neu, tgt = per_token_margins(nc, "neutral"), per_token_margins(nc, args.source)
 
     lm = LM.load(MODELS[args.model])
-    base = [BaseItem(lm.encode_prompt(build_prompt("neutral", it)),
+    base_cond = args.source if reverse else "neutral"
+    base = [BaseItem(lm.encode_prompt(build_prompt(base_cond, it)),
                      lm.encode_answer(it["c_plus"]), lm.encode_answer(it["c_minus"])) for it in nc]
     blocks = chunk(parse_blocks(args.blocks, lm.n_layers), args.chunk)
     for seed in args.seeds:
         src_dir = root / args.from_tag / f"seed{seed}"
         test = np.array(json.loads((src_dir / "split.json").read_text())["test"])
         perm = derangement(len(test), np.random.default_rng(10_000 + seed))
-        out_dir = root / "illusion" / f"seed{seed}"
+        out_dir = root / ("illusion_reverse" if reverse else "illusion") / f"seed{seed}"
         out_dir.mkdir(parents=True, exist_ok=True)
         for b in blocks:
             w_file = src_dir / f"block{b:02d}__das__k{args.k}__src-{args.source}.W.pt"
@@ -94,24 +110,27 @@ def main():
                 print(f"seed {seed} block {b}: no trained W, skipping")
                 continue
             srcs = control_sources(np.asarray(cache_b[:, b], dtype=np.float32),
-                                   np.asarray(cache_n[:, b], dtype=np.float32), test, perm)
+                                   np.asarray(cache_n[:, b], dtype=np.float32), test, perm, reverse)
+            # margin of the unintervened base run and the margin the intervention aims at
+            m_base, m_aim = (tgt, neu) if reverse else (neu, tgt)
             W = torch.load(w_file).float().to(lm.device)
             for method, w in [("das", W), ("patch", None)]:
                 f = out_dir / f"block{b:02d}__{method}.json"
                 if f.exists():
                     continue
                 res = {"model": args.model, "seed": seed, "block": b, "method": method, "k": args.k,
-                       "source": args.source, "test_rows": test.tolist(), "perm": perm.tolist(),
-                       "m_neutral": neu["mean"][test].tolist(), "m_neutral_first": neu["first"][test].tolist(),
-                       "m_src": tgt["mean"][test].tolist(), "m_src_first": tgt["first"][test].tolist(),
+                       "source": args.source, "direction": args.direction,
+                       "test_rows": test.tolist(), "perm": perm.tolist(),
+                       "m_neutral": m_base["mean"][test].tolist(), "m_neutral_first": m_base["first"][test].tolist(),
+                       "m_src": m_aim["mean"][test].tolist(), "m_src_first": m_aim["first"][test].tolist(),
                        "controls": {}}
                 for c in CONTROLS:
                     m = evaluate(lm, base, test, b, srcs[c], w)
                     res["controls"][c] = {"m_int": m["mean"].tolist(), "m_int_first": m["first"].tolist()}
                 write_json(f, res)
-                rec = {c: np.mean(np.array(res["controls"][c]["m_int_first"]) - neu["first"][test])
-                       / np.mean(tgt["first"][test] - neu["first"][test]) for c in CONTROLS}
-                print(f"seed {seed} block {b:2d} {method:5s} first-token shift recovered: "
+                rec = {c: np.mean(np.array(res["controls"][c]["m_int_first"]) - m_base["first"][test])
+                       / np.mean(m_aim["first"][test] - m_base["first"][test]) for c in CONTROLS}
+                print(f"seed {seed} block {b:2d} {method:5s} first-token shift {'removed' if reverse else 'recovered'}: "
                       + "  ".join(f"{c}={v:+.2f}" for c, v in rec.items()))
 
 

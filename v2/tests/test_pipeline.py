@@ -144,6 +144,20 @@ def test_position_experiments(lm):
     assert pos["answer"] == [9, 10] and pos["span"] == list(range(4, 16)), pos
     assert pos["framing"] == [4, 5, 6, 7, 8, 11, 12, 13, 14, 15] and pos["suffix"] == [16, 17]
     assert pos["last"] == [len(ids) - 1] == [17]
+    from v2.positions import resample_prefix, span_positions
+    # mention templates: "Random word: X" (answer at the end) and '(The phrase "X" has ...)'
+    ids1, p1 = span_positions(lm, it, "mention_plausible_1")
+    assert p1["answer"] == [6, 7] and p1["framing"] == [4, 5] and p1["suffix"] == [8, 9], p1
+    _, p3 = span_positions(lm, it, "mention_irrelevant_3")  # x = r = "Paris"
+    assert len(p3["answer"]) == 1 and p3["framing"][0] == 4 and p3["framing"][-1] > p3["answer"][0]
+    # resample: x' must be token-aligned and differ only at the answer positions
+    pool = ["Ben Jonson", "Paris", "Shakespeare", "Thomas Kyd", "John Webster"]
+    ids2 = resample_prefix(lm, it, "assert_plausible", ids, pos, pool, np.random.default_rng(0))
+    assert ids2 is not None and len(ids2) == len(ids)
+    assert [j for j in range(len(ids)) if ids2[j] != ids[j]] and all(
+        ids2[j] == ids[j] for j in range(len(ids)) if j not in pos["answer"])
+    assert resample_prefix(lm, it, "assert_plausible", ids, pos, ["Paris", "Shakespeare"],
+                           np.random.default_rng(0)) is None  # no 2-token candidate left
 
     rng = np.random.default_rng(3)
 
@@ -153,7 +167,9 @@ def test_position_experiments(lm):
                           {"answer": list(range(a0, a1)), "span": list(range(s0, a1 + 1)),
                            "framing": [x for x in range(s0, a1 + 1) if not a0 <= x < a1],
                            "suffix": list(range(a1 + 1, P)), "last": [P - 1],
-                           "after_all": list(range(s0, P))})
+                           "after_all": list(range(s0, P))},
+                          corr_prefix=[t if not a0 <= j < a1 else (t + 11) % (VOCAB - 3) + 3
+                                       for j, t in enumerate(pre)])
     items = [item(12, 5, 7, 3, 2), item(10, 4, 5, 2, 3), item(12, 6, 8, 4, 1), item(11, 4, 6, 3, 2, 2)]
 
     # knockout: if nothing after the span can attend to it at any block, the margins must
@@ -184,8 +200,8 @@ def test_position_experiments(lm):
     # clean first-token margin back (it is read at the last prompt position); removing them
     # gives the corrupted one. Later answer tokens also attend the span at blocks <= b, so
     # the exact identity holds for the first token only. The noise itself must matter.
-    for blk in [0, lm.n_layers - 1]:
-        res = run_block(lm, items, blk, ["after_all", "last"], scale=5.0, seed=0, bs=2)
+    for blk, corruption in [(0, "noise"), (lm.n_layers - 1, "noise"), (1, "resample")]:
+        res = run_block(lm, items, blk, ["after_all", "last"], scale=5.0, seed=0, bs=2, corruption=corruption)
         for part in ["first"]:
             cl, co = np.array(res["clean"][part]), np.array(res["corr"][part])
             assert np.abs(cl - co).max() > 1e-3, "noise had no effect"
@@ -232,8 +248,30 @@ def test_integration(dataset_path):
         from v2 import run_knockout, run_tracing
         run(run_tracing, "--blocks", "0,3", "--limit", "8", "--bs", "3")
         run(run_knockout, "--blocks", "1,2", "--limit", "8", "--bs", "3", "--window", "2")
-        assert len(list((root / "tracing").glob("block*.json"))) == 2
-        assert len(list((root / "knockout").glob("block*.json"))) == 2
+        assert len(list((root / "tracing" / "assert_plausible__noise__s0").glob("block*.json"))) == 2
+        assert len(list((root / "knockout" / "assert_plausible").glob("block*.json"))) == 2
+        # results of the first E6/E7 runs on the cluster sit directly in tracing/ and
+        # knockout/: they must be reused (not recomputed) and found by analyze
+        import shutil
+        for kind, tag in [("tracing", "assert_plausible__noise__s0"), ("knockout", "assert_plausible")]:
+            for f in (root / kind / tag).glob("block*.json"):
+                shutil.move(str(f), str(root / kind / f.name))
+            (root / kind / tag).rmdir()
+        run(run_tracing, "--blocks", "0,3", "--limit", "8", "--bs", "3")
+        run(run_knockout, "--blocks", "1,2", "--limit", "8", "--bs", "3", "--window", "2")
+        assert not (root / "tracing" / "assert_plausible__noise__s0").exists()
+        assert not (root / "knockout" / "assert_plausible").exists()
+        # further conditions / corruptions / draws go to their own folders
+        run(run_tracing, "--blocks", "0,3", "--limit", "8", "--bs", "3", "--seed", "1")
+        run(run_tracing, "--blocks", "0,3", "--limit", "8", "--bs", "3", "--condition", "mention_plausible_1")
+        run(run_tracing, "--blocks", "0,3", "--limit", "8", "--bs", "3", "--corruption", "resample")
+        run(run_knockout, "--blocks", "1,2", "--limit", "8", "--bs", "3", "--window", "2",
+            "--condition", "mention_plausible_1")
+        for tag in ["assert_plausible__noise__s1", "mention_plausible_1__noise__s0", "assert_plausible__resample__s0"]:
+            assert len(list((root / "tracing" / tag).glob("block*.json"))) == 2, tag
+        assert len(list((root / "knockout" / "mention_plausible_1").glob("block*.json"))) == 2
+        run(run_illusion_control, "--seeds", "0", "1", "--k", "4", "--direction", "reverse")
+        assert len(list((root / "illusion_reverse").glob("seed*/block*.json"))) == 2 * 4 * 2
         n_main = len(list((root / "main").glob("seed*/block*.json")))
         assert n_main == 2 * 4 * 2, n_main  # seeds x blocks x {patch, das}
         sys.argv = ["x", "--results-root", tmp]
@@ -246,6 +284,12 @@ def test_integration(dataset_path):
         produced = sorted(p.name for p in (root / "analysis").iterdir())
         print("analysis outputs:", produced)
         import csv
+        tr = list(csv.DictReader(open(root / "analysis" / "tracing.csv")))
+        assert {r["config"] for r in tr} == {"assert_plausible__noise", "mention_plausible_1__noise",
+                                             "assert_plausible__resample"}
+        assert {r["n_seeds"] for r in tr if r["config"] == "assert_plausible__noise"} == {"2"}  # s0 + s1 pooled
+        ko = list(csv.DictReader(open(root / "analysis" / "knockout.csv")))
+        assert {r["config"] for r in ko} == {"assert_plausible", "mention_plausible_1"} and "shift_first_abs" in ko[0]
         row = next(csv.DictReader(open(root / "analysis" / "main_k4.csv")))
         for col in ["das_iia_seed_sd", "diff_iia_seed_sd", "das_shift_recovered_first", "das_shift_r",
                     "patch_shift_recovered_rest", "n_test_rest"]:
@@ -272,7 +316,9 @@ def test_integration(dataset_path):
             pass
         for f in ["behavior.md", "main_k4.csv", "fig_main_k4.png", "fig_first_vs_rest_k4.png",
                   "illusion.csv", "fig_illusion.png", "tracing.csv", "fig_tracing.png",
-                  "knockout.csv", "fig_knockout.png",
+                  "knockout.csv", "fig_knockout.png", "illusion_reverse.csv", "fig_illusion_reverse.png",
+                  "fig_tracing__mention_plausible_1__noise.png", "fig_tracing__assert_plausible__resample.png",
+                  "fig_knockout__mention_plausible_1.png", "fig_condition_compare.png",
                   "rank.csv", "transfer_k4.csv",
                   "subspace_overlap_k4.csv", "fig_probe.png", "table_main_k4.tex"]:
             assert f in produced, f"missing {f}"
