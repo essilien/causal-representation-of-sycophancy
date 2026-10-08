@@ -95,16 +95,16 @@ def scores(lm, seqs, layers=(), block_mask=None):
         return pair_margins(lm.token_logprobs(seqs))
 
 
-def run_block(lm, items, b, width, bs):
+def run_block(lm, items, b, width, bs, keys=KEYS):
     L = lm.n_layers
     windows = {"from": list(range(b, L)), "win": list(range(b, min(b + width, L)))}
-    res = {"biased": [], **{f"{w}/{k}/{q}": [] for w in WINDOWS for k in KEYS for q in QUERIES}}
+    res = {"biased": [], **{f"{w}/{k}/{q}": [] for w in WINDOWS for k in keys for q in QUERIES}}
     for s in range(0, len(items), bs):
         idx = list(range(s, min(s + bs, len(items))))
         seqs = [Seq(items[i].prefix, c) for i in idx for c in (items[i].c_plus, items[i].c_minus)]
         T = max(len(x.prefix) + len(x.cand) for x in seqs)
         res["biased"].append(scores(lm, seqs))
-        for k in KEYS:
+        for k in keys:
             for q in QUERIES:
                 bm = blocked(items, idx, k, q, T, lm.device)
                 for w in WINDOWS:
@@ -136,11 +136,14 @@ def main():
     lm = LM.load(MODELS[args.model])
     items, rows = assert_items(lm, nc, args.condition)
     out_dir = run_dir(root, "knockout", args.condition, LEGACY_TAG)
+    # content-free conditions have no answer tokens (and framing == span)
+    keys = [k for k in KEYS if all(it.pos[k] for it in items)]
     out_dir.mkdir(parents=True, exist_ok=True)
     blocks = chunk(parse_blocks(args.blocks, lm.n_layers), args.chunk)
     print(f"{args.model} {args.condition}: {len(items)}/{len(nc)} items, window {args.window}, blocks {blocks}")
     sfx = [("mean", ""), ("first", "_first"), ("rest", "_rest")]
     common = {"model": args.model, "condition": args.condition, "rows": rows, "window": args.window,
+              "keys": keys,
               **{f"m_neutral{s}": neu[p][rows].tolist() for p, s in sfx},
               **{f"m_biased_behavior{s}": bia[p][rows].tolist() for p, s in sfx}}
     mn = np.array(common["m_neutral_first"])
@@ -148,11 +151,11 @@ def main():
         f = out_dir / f"block{b:02d}.json"
         if f.exists():
             continue
-        res = run_block(lm, items, b, args.window, args.bs)
+        res = run_block(lm, items, b, args.window, args.bs, keys)
         write_json(f, {**common, "block": b, "margins": res})
         mb = np.array(res["biased"]["first"])
         msg = [f"{w}/{k}/{q}={np.mean(np.array(res[f'{w}/{k}/{q}']['first']) - mb) / np.mean(mn - mb):+.2f}"
-               for w in WINDOWS for k in KEYS for q in QUERIES if q == "suffix"]
+               for w in WINDOWS for k in keys for q in QUERIES if q == "suffix"]
         print(f"block {b:2d} (first token, eliminated): " + "  ".join(msg))
 
 

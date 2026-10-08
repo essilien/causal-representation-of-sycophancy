@@ -29,10 +29,12 @@ from v2.data import items_fingerprint, load_items, read_jsonl, rest_margin, writ
 from v2.lm import LM, Seq
 
 
-def score_all(lm: LM, items, bs: int, log=print):
+def score_all(lm: LM, items, bs: int, log=print, conditions=None):
+    """Scores every candidate under `conditions` (default: all) and recomputes all margins.
+    Conditions already in items[i]["lp"] are kept as they are."""
     jobs = []  # (item index, condition, candidate key, Seq)
     for i, it in enumerate(items):
-        for cond in CONDITIONS:
+        for cond in (conditions or CONDITIONS):
             prefix = lm.encode_prompt(build_prompt(cond, it))
             for key in candidates_for(cond):
                 jobs.append((i, cond, key, Seq(prefix, lm.encode_answer(it[key]))))
@@ -102,7 +104,13 @@ def main():
             raise RuntimeError(f"{out} holds results for a different question set or model "
                                "(other --limit/--dataset-path?). Use a fresh --results-root.")
         items = read_jsonl(out / "items.jsonl")
-        print("items.jsonl exists for the same questions, reusing scores")
+        missing = [c for c in CONDITIONS if c not in items[0]["lp"]]
+        print(f"items.jsonl exists for the same questions, reusing scores; scoring new conditions: {missing}")
+        if missing:
+            # neutral is never missing here, so the neutral-correct set (and the cache row
+            # order every later stage relies on) is unchanged
+            assert "neutral" not in missing
+            score_all(lm, items, args.bs, conditions=missing)
     else:
         score_all(lm, items, args.bs)
     nc_ids = [it["id"] for it in items if it["margin"]["neutral"] > 0]

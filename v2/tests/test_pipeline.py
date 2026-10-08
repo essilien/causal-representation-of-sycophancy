@@ -8,6 +8,7 @@ CPU tests with a tiny randomly initialized Llama (no downloads, ~1 min):
     python -m v2.tests.test_pipeline [--dataset-path answer.jsonl]
 """
 import argparse
+import json
 import sys
 import tempfile
 import zlib
@@ -150,6 +151,9 @@ def test_position_experiments(lm):
     assert p1["answer"] == [6, 7] and p1["framing"] == [4, 5] and p1["suffix"] == [8, 9], p1
     _, p3 = span_positions(lm, it, "mention_irrelevant_3")  # x = r = "Paris"
     assert len(p3["answer"]) == 1 and p3["framing"][0] == 4 and p3["framing"][-1] > p3["answer"][0]
+    # content-free framing: no answer tokens, the whole sentence is framing
+    ide, pe = span_positions(lm, it, "assert_empty_2")  # "I think I know the answer, but I'm really not sure."
+    assert pe["answer"] == [] and pe["framing"] == pe["span"] == list(range(4, 15)) and pe["suffix"] == [15, 16], pe
     # resample: x' must be token-aligned and differ only at the answer positions
     pool = ["Ben Jonson", "Paris", "Shakespeare", "Thomas Kyd", "John Webster"]
     ids2 = resample_prefix(lm, it, "assert_plausible", ids, pos, pool, np.random.default_rng(0))
@@ -272,6 +276,38 @@ def test_integration(dataset_path):
         assert len(list((root / "knockout" / "mention_plausible_1").glob("block*.json"))) == 2
         run(run_illusion_control, "--seeds", "0", "1", "--k", "4", "--direction", "reverse")
         assert len(list((root / "illusion_reverse").glob("seed*/block*.json"))) == 2 * 4 * 2
+        # content-free framing as the biased side of the trained subspaces, both directions
+        for d in ["forward", "reverse"]:
+            run(run_illusion_control, "--seeds", "0", "--k", "4", "--direction", d,
+                "--eval-condition", "assert_empty_2", "--controls", "matched")
+        f0 = json.loads(next((root / "illusion_reverse__assert_empty_2" / "seed0").glob("block*__das.json")).read_text())
+        assert list(f0["controls"]) == ["matched"] and f0["eval_condition"] == "assert_empty_2"
+        run(run_knockout, "--blocks", "1", "--limit", "8", "--bs", "3", "--condition", "assert_empty_1")
+        k0 = json.loads(next((root / "knockout" / "assert_empty_1").glob("block*.json")).read_text())
+        assert k0["keys"] == ["framing", "span"] and "from/answer/after" not in k0["margins"]
+        run(run_tracing, "--blocks", "1", "--limit", "8", "--bs", "3", "--condition", "mention_empty_1")
+        t0 = json.loads(next((root / "tracing" / "mention_empty_1__noise__s0").glob("block*.json")).read_text())
+        assert "answer" not in t0["groups"] and "restore/span" in t0["margins"]
+        from v2 import run_answer_direction
+        run(run_answer_direction, "--seeds", "0", "1", "--k", "4")
+        ad = json.loads((root / "answer_direction" / "seed0.json").read_text())
+        assert len(ad["seen"]) == len(ad["test_rows"]) and "w_on_test" in ad["blocks"]["1"]
+        # behavior resume: a condition added later is scored and cached without touching
+        # the others (simulated by deleting one from the stored results)
+        items_f, cache_d = root / "behavior" / "items.jsonl", root / "behavior" / "cache"
+        rows_ = [json.loads(l) for l in items_f.read_text().splitlines()]
+        old_neutral = [r["margin"]["neutral"] for r in rows_]
+        for r in rows_:
+            for key in ["lp", "margin", "margin_first", "margin_rest", "margin_sum"]:
+                r[key].pop("assert_empty_3", None)
+        items_f.write_text("\n".join(json.dumps(r) for r in rows_) + "\n")
+        (cache_d / "assert_empty_3.npy").unlink()
+        mt = (cache_d / "assert_plausible.npy").stat().st_mtime
+        run(run_behavior, "--limit", "60", "--bs", "16")
+        rows_ = [json.loads(l) for l in items_f.read_text().splitlines()]
+        assert all("assert_empty_3" in r["margin"] for r in rows_)
+        assert [r["margin"]["neutral"] for r in rows_] == old_neutral
+        assert (cache_d / "assert_empty_3.npy").exists() and (cache_d / "assert_plausible.npy").stat().st_mtime == mt
         n_main = len(list((root / "main").glob("seed*/block*.json")))
         assert n_main == 2 * 4 * 2, n_main  # seeds x blocks x {patch, das}
         sys.argv = ["x", "--results-root", tmp]
@@ -286,10 +322,11 @@ def test_integration(dataset_path):
         import csv
         tr = list(csv.DictReader(open(root / "analysis" / "tracing.csv")))
         assert {r["config"] for r in tr} == {"assert_plausible__noise", "mention_plausible_1__noise",
-                                             "assert_plausible__resample"}
+                                             "assert_plausible__resample", "mention_empty_1__noise"}
         assert {r["n_seeds"] for r in tr if r["config"] == "assert_plausible__noise"} == {"2"}  # s0 + s1 pooled
         ko = list(csv.DictReader(open(root / "analysis" / "knockout.csv")))
-        assert {r["config"] for r in ko} == {"assert_plausible", "mention_plausible_1"} and "shift_first_abs" in ko[0]
+        assert {r["config"] for r in ko} == {"assert_plausible", "mention_plausible_1", "assert_empty_1"}
+        assert "shift_first_abs" in ko[0]
         row = next(csv.DictReader(open(root / "analysis" / "main_k4.csv")))
         for col in ["das_iia_seed_sd", "diff_iia_seed_sd", "das_shift_recovered_first", "das_shift_r",
                     "patch_shift_recovered_rest", "n_test_rest"]:
@@ -319,6 +356,8 @@ def test_integration(dataset_path):
                   "knockout.csv", "fig_knockout.png", "illusion_reverse.csv", "fig_illusion_reverse.png",
                   "fig_tracing__mention_plausible_1__noise.png", "fig_tracing__assert_plausible__resample.png",
                   "fig_knockout__mention_plausible_1.png", "fig_condition_compare.png",
+                  "fig_knockout__assert_empty_1.png", "illusion__assert_empty_2.csv",
+                  "illusion_reverse__assert_empty_2.csv", "answer_direction.csv",
                   "rank.csv", "transfer_k4.csv",
                   "subspace_overlap_k4.csv", "fig_probe.png", "table_main_k4.tex"]:
             assert f in produced, f"missing {f}"

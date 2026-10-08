@@ -105,11 +105,11 @@ def fmt(t, pct=False):
 def write_csv(path, rows):
     if not rows:
         return
-    keys = list(rows[0])
+    keys = list(dict.fromkeys(k for r in rows for k in r))  # union: configurations differ in columns
     with open(path, "w") as f:
         f.write(",".join(keys) + "\n")
         for r in rows:
-            f.write(",".join(str(r[k]) for k in keys) + "\n")
+            f.write(",".join(str(r.get(k, "")) for k in keys) + "\n")
     print(f"  wrote {path}")
 
 
@@ -126,8 +126,9 @@ def analyze_behavior(root: Path, out: Path):
                  f"{d} {sum(it['dataset'] == d for it in nc)}/{sum(it['dataset'] == d for it in items)}"
                  for d in sorted({it['dataset'] for it in items})), ""]
     rows = []
-    D = {c: np.array([it["margin"][c] - it["margin"]["neutral"] for it in nc]) for c in CONDITIONS}
-    for c in CONDITIONS:
+    conds = [c for c in CONDITIONS if c in nc[0]["margin"]]  # older runs lack the content-free ones
+    D = {c: np.array([it["margin"][c] - it["margin"]["neutral"] for it in nc]) for c in conds}
+    for c in conds:
         if c == "neutral":
             continue
         k = sum(it["margin"][c] < 0 for it in nc)
@@ -436,8 +437,11 @@ def analyze_illusion(root: Path, out: Path):
     necessity test (reverse: biased base, subspace set to a non-biased source). See
     v2/run_illusion_control.py. Both store m_int / m_src (aim) / m_neutral (base run)."""
     found = False
-    for folder, name, ylabel in [("illusion", "illusion", "First-token shift recovered\n(relative to item's own shift)"),
-                                 ("illusion_reverse", "illusion_reverse", "First-token shift removed\n(relative to item's own shift)")]:
+    folders = sorted(d.name for d in root.glob("illusion*") if d.is_dir())
+    for folder in folders:
+        name = folder
+        ylabel = ("First-token shift removed" if folder.startswith("illusion_reverse") else
+                  "First-token shift recovered") + "\n(relative to item's own shift)"
         files = sorted((root / folder).glob("seed*/block*.json"))
         if not files:
             continue
@@ -460,6 +464,10 @@ def _illusion_dir(files, out, name, ylabel):
                 t = [(np.array(r["controls"][c][f"m_int{part}"]), np.array(r[f"m_src{part}"]),
                       np.array(r[f"m_neutral{part}"])) for r in rs]
                 (row[f"{c}{sfx}"], row[f"{c}{sfx}_lo"], row[f"{c}{sfx}_hi"], _) = boot(t, v_rec)
+                # log-prob units: needed when the condition's own shift is small (content-free)
+                (row[f"{c}{sfx}_abs"], row[f"{c}{sfx}_abs_lo"], row[f"{c}{sfx}_abs_hi"], _) = boot(t, v_abs)
+                if c == "matched":  # the condition's own shift, for reference
+                    row[f"shift{sfx}_abs"] = float(np.mean([np.mean(x[1] - x[2]) for x in t]))
         rows.append(row)
     write_csv(out / f"{name}.csv", rows)
     import matplotlib
@@ -601,8 +609,9 @@ def analyze_knockout(root: Path, out: Path):
         return
     all_rows = {}
     for cfg, runs in sorted(configs.items()):
+        keys = next(iter(runs.values()))[0].get("keys", KEYS)
         conds = {f"{w}_{k}_{q}": (f"{w}/{k}/{q}", "neutral", "biased")
-                 for w in WINDOWS for k in KEYS for q in QUERIES}
+                 for w in WINDOWS for k in keys for q in QUERIES}
         conds["shift"] = ("biased", "neutral", "neutral")  # absolute shift: mean(m_cond - m_neutral)
         rows = _position_rows(runs, conds, {"neutral": "m_neutral"})
         for r in rows:  # `shift` is only meaningful in log-prob units (its fraction is x/0)
@@ -611,8 +620,8 @@ def analyze_knockout(root: Path, out: Path):
         all_rows[cfg] = rows
         w = next(iter(runs.values()))[0]["window"]
         sfx = "" if cfg == LEGACY_TAG else f"__{cfg}"
-        _plot_positions(rows, [(f"Blocked from block b on", [(f"from_{k}_after", k) for k in KEYS]),
-                               (f"Blocked in blocks b..b+{w - 1}", [(f"win_{k}_after", k) for k in KEYS])],
+        _plot_positions(rows, [(f"Blocked from block b on", [(f"from_{k}_after", k) for k in keys]),
+                               (f"Blocked in blocks b..b+{w - 1}", [(f"win_{k}_after", k) for k in keys])],
                         out / f"fig_knockout{sfx}.png", f"{cfg}\nfraction of shift eliminated")
     write_csv(out / "knockout.csv", [x for cfg, rows in sorted(all_rows.items()) for x in _with_config(cfg, rows)])
     if len(all_rows) > 1:
@@ -627,8 +636,7 @@ def analyze_tracing_rows(root):
     for cfg, runs in configs.items():
         cond, corruption = cfg.split("__")
         if corruption == "noise":
-            out[cond] = _position_rows(runs, {"restore_last": ("restore/last", "clean", "corr"),
-                                              "restore_answer": ("restore/answer", "clean", "corr")},
+            out[cond] = _position_rows(runs, {"restore_last": ("restore/last", "clean", "corr")},
                                        {"neutral": "m_neutral"})
     return out
 
@@ -661,6 +669,45 @@ def _plot_condition_compare(ko, tr, path):
     print(f"  wrote {path}")
 
 
+def analyze_answer_direction(root: Path, out: Path, k=64):
+    """See v2/run_answer_direction.py. Per block: how much of Delta points at the item's own
+    answer direction (vs. another item's), how much of the answer directions of test vs.
+    training items lies in span(W), and DAS / patching first-token recovery for test items
+    whose c_minus first token was or was not seen in training."""
+    files = sorted((root / "answer_direction").glob("seed*.json"))
+    if not files:
+        print("  answer_direction: no results yet")
+        return
+    runs = [json.loads(f.read_text()) for f in files]
+    main = load_runs(root, "main")
+    das, patch = main.get(("das", k, MAIN_SOURCE), {}), main.get(("patch", None, None), {})
+    rows = []
+    for b in sorted(int(x) for x in runs[0]["blocks"]):
+        row = {"block": b, "n_seeds": len(runs)}
+        for key in ["delta_on_own", "delta_on_other", "w_on_test", "w_on_train", "delta_in_w"]:
+            vals = [np.mean(r["blocks"][str(b)][key]) for r in runs if key in r["blocks"][str(b)]]
+            row[key] = float(np.mean(vals)) if vals else float("nan")
+        row["w_chance"] = runs[0]["blocks"][str(b)].get("w_chance", float("nan"))
+        for name, res in [("das", das), ("patch", patch)]:
+            for grp, want in [("seen", True), ("unseen", False)]:
+                ts = []
+                for r in runs:
+                    jr = res.get((r["seed"], b))
+                    if jr is None or jr["test_rows"] != r["test_rows"]:
+                        continue
+                    mask = np.array(r["seen"]) == want
+                    e = jr["eval"][MAIN_SOURCE]
+                    ts.append(tuple(np.array(x, dtype=float)[mask] for x in
+                                    (e["m_int_first"], e["m_src_first"], jr["m_neutral_first"])))
+                if ts:
+                    row[f"{name}_rec_first_{grp}"], row[f"{name}_rec_first_{grp}_lo"], \
+                        row[f"{name}_rec_first_{grp}_hi"], _ = boot(ts, v_rec)
+        row["n_seen"] = int(np.mean([sum(r["seen"]) for r in runs]))
+        row["n_unseen"] = int(np.mean([len(r["seen"]) - sum(r["seen"]) for r in runs]))
+        rows.append(row)
+    write_csv(out / "answer_direction.csv", rows)
+
+
 def analyze_probe(root: Path, out: Path):
     f = root / "probe.json"
     if not f.exists():
@@ -690,7 +737,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="llama")
     ap.add_argument("--results-root", required=True)
-    ap.add_argument("--only", nargs="+", default=["behavior", "probe", "main", "rank", "transfer", "illusion", "tracing", "knockout"])
+    ap.add_argument("--only", nargs="+", default=["behavior", "probe", "main", "rank", "transfer", "illusion", "tracing", "knockout",
+                             "answer_direction"])
     args = ap.parse_args()
     root = Path(args.results_root) / args.model
     out = root / "analysis"
@@ -699,7 +747,8 @@ def main():
         print(f"== {part} ==")
         {"behavior": analyze_behavior, "probe": analyze_probe, "main": analyze_main,
          "rank": analyze_rank, "transfer": analyze_transfer, "illusion": analyze_illusion,
-         "tracing": analyze_tracing, "knockout": analyze_knockout}[part](root, out)
+         "tracing": analyze_tracing, "knockout": analyze_knockout,
+         "answer_direction": analyze_answer_direction}[part](root, out)
 
 
 if __name__ == "__main__":

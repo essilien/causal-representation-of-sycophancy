@@ -11,6 +11,9 @@ For assert_plausible, "{question} I think the answer is {c_minus} but I'm really
             header), including the last prompt token where all v1/v2 interventions sat
   last    : the last prompt token only
 
+Content-free conditions (config.CONTENT_FREE) insert no answer: `answer` is empty and the
+whole inserted sentence counts as `framing`.
+
 `resample` corruption (run_tracing) needs a second prompt in which x is replaced by a
 different answer x' that tokenizes to the same number of tokens and leaves every other
 token unchanged, so the two runs are position-aligned (symmetric token replacement).
@@ -46,13 +49,18 @@ def span_positions(lm, item: dict, cond: str = "assert_plausible", x: str | None
     answer (used to build the resample corruption)."""
     template = CONDITIONS[cond][0]
     q = item["question"]
-    x = item[_x_key(cond)] if x is None else x
-    user = template.format(question=q, x=x)
-    pre = template.split("{x}")[0].format(question=q)
-    assert template.startswith("{question}") and user.startswith(pre + x)
-    if user != build_prompt(cond, {**item, _x_key(cond): x}):
-        raise AssertionError("prompt construction diverged from config.build_prompt")
-    a0, x0, x1 = len(q), len(pre), len(pre) + len(x)
+    assert template.startswith("{question}")
+    if "{x}" in template:
+        x = item[_x_key(cond)] if x is None else x
+        user = template.format(question=q, x=x)
+        pre = template.split("{x}")[0].format(question=q)
+        assert user.startswith(pre + x)
+        if user != build_prompt(cond, {**item, _x_key(cond): x}):
+            raise AssertionError("prompt construction diverged from config.build_prompt")
+        a0, x0, x1 = len(q), len(pre), len(pre) + len(x)
+    else:  # content-free: no answer tokens
+        user = build_prompt(cond, item)
+        a0, x0, x1 = len(q), -1, -1
     ids, offs = lm.encode_prompt_offsets(user)
     answer, framing = [], []
     for i, o in enumerate(offs):
@@ -64,7 +72,7 @@ def span_positions(lm, item: dict, cond: str = "assert_plausible", x: str | None
         elif e > a0:
             framing.append(i)
     span = sorted(answer + framing)
-    if not answer or span != list(range(span[0], span[-1] + 1)):
+    if not span or (not answer and "{x}" in template) or span != list(range(span[0], span[-1] + 1)):
         raise ValueError(f"could not locate a contiguous span for {q[:60]!r}")
     suffix = list(range(span[-1] + 1, len(ids)))
     if not suffix or any(offs[i] is not None for i in suffix):
@@ -101,7 +109,7 @@ def assert_items(lm, nc: list[dict], cond: str = "assert_plausible", resample_se
     """AssertItems for the neutral-correct items whose span could be located (and, with
     resample_seed, a token-aligned x' found), plus their row indices into nc."""
     out, rows, skipped = [], [], 0
-    pool = sorted({it[_x_key(cond)] for it in nc})
+    pool = sorted({it[_x_key(cond)] for it in nc}) if resample_seed is not None else []
     for r, it in enumerate(nc):
         try:
             ids, pos = span_positions(lm, it, cond)

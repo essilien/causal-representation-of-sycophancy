@@ -191,6 +191,8 @@ def main():
     resample = args.corruption == "resample"
     items, rows = assert_items(lm, nc, args.condition, resample_seed=args.seed if resample else None)
     scale = noise_scale(lm, items, args.noise_mult)
+    # content-free conditions have no answer tokens: drop groups that are empty everywhere
+    args.groups = [g for g in args.groups if any(it.pos[g] for it in items)]
     tag = f"{args.condition}__{args.corruption}__s{args.seed}"
     out_dir = run_dir(root, "tracing", tag, LEGACY_TAG)
     out_dir.mkdir(parents=True, exist_ok=True)

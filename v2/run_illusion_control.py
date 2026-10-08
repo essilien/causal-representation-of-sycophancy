@@ -26,6 +26,13 @@ vector) is set to a non-biased source. Fraction removed = (m_int - m_biased) /
   other_biased  : another item's biased representation (should remove only the
                   item-specific part)
 
+--eval-condition C (default: --source) keeps the subspace trained on --source but takes the
+biased side from condition C: its cached representation is inserted into the neutral run
+(forward), or its prompt is the base whose subspace is set to the neutral value (reverse).
+With a content-free C (config.CONTENT_FREE) this asks whether the subspace carries the
+assertion framing alone. Results go to illusion[_reverse]__C/; --controls matched skips
+the mismatched sources.
+
 Outputs <results>/<model>/illusion[_reverse]/seed*/block*__{das,patch}.json with per-item
 margins (mean-token and first-token) per source, stored as m_int, m_src (the margin the
 intervention aims at) and m_neutral (the base run's margin; for reverse: the biased run);
@@ -81,20 +88,23 @@ def main():
     ap.add_argument("--blocks", default="all")
     ap.add_argument("--chunk", default=None)
     ap.add_argument("--direction", choices=["forward", "reverse"], default="forward")
+    ap.add_argument("--eval-condition", default=None, help="biased side of the intervention (default: --source)")
+    ap.add_argument("--controls", nargs="+", default=CONTROLS, choices=CONTROLS)
     args = ap.parse_args()
     reverse = args.direction == "reverse"
+    ev = args.eval_condition or args.source
 
     root = Path(args.results_root) / args.model
     beh = root / "behavior"
     meta = json.loads((beh / "meta.json").read_text())
     items = read_jsonl(beh / "items.jsonl")
     nc = [items[i] for i in meta["nc_ids"]]
-    cache_b = np.load(beh / "cache" / f"{args.source}.npy", mmap_mode="r")
+    cache_b = np.load(beh / "cache" / f"{ev}.npy", mmap_mode="r")
     cache_n = np.load(beh / "cache" / "neutral.npy", mmap_mode="r")
-    neu, tgt = per_token_margins(nc, "neutral"), per_token_margins(nc, args.source)
+    neu, tgt = per_token_margins(nc, "neutral"), per_token_margins(nc, ev)
 
     lm = LM.load(MODELS[args.model])
-    base_cond = args.source if reverse else "neutral"
+    base_cond = ev if reverse else "neutral"
     base = [BaseItem(lm.encode_prompt(build_prompt(base_cond, it)),
                      lm.encode_answer(it["c_plus"]), lm.encode_answer(it["c_minus"])) for it in nc]
     blocks = chunk(parse_blocks(args.blocks, lm.n_layers), args.chunk)
@@ -102,7 +112,8 @@ def main():
         src_dir = root / args.from_tag / f"seed{seed}"
         test = np.array(json.loads((src_dir / "split.json").read_text())["test"])
         perm = derangement(len(test), np.random.default_rng(10_000 + seed))
-        out_dir = root / ("illusion_reverse" if reverse else "illusion") / f"seed{seed}"
+        folder = ("illusion_reverse" if reverse else "illusion") + ("" if ev == args.source else f"__{ev}")
+        out_dir = root / folder / f"seed{seed}"
         out_dir.mkdir(parents=True, exist_ok=True)
         for b in blocks:
             w_file = src_dir / f"block{b:02d}__das__k{args.k}__src-{args.source}.W.pt"
@@ -119,17 +130,17 @@ def main():
                 if f.exists():
                     continue
                 res = {"model": args.model, "seed": seed, "block": b, "method": method, "k": args.k,
-                       "source": args.source, "direction": args.direction,
+                       "source": args.source, "eval_condition": ev, "direction": args.direction,
                        "test_rows": test.tolist(), "perm": perm.tolist(),
                        "m_neutral": m_base["mean"][test].tolist(), "m_neutral_first": m_base["first"][test].tolist(),
                        "m_src": m_aim["mean"][test].tolist(), "m_src_first": m_aim["first"][test].tolist(),
                        "controls": {}}
-                for c in CONTROLS:
+                for c in args.controls:
                     m = evaluate(lm, base, test, b, srcs[c], w)
                     res["controls"][c] = {"m_int": m["mean"].tolist(), "m_int_first": m["first"].tolist()}
                 write_json(f, res)
                 rec = {c: np.mean(np.array(res["controls"][c]["m_int_first"]) - m_base["first"][test])
-                       / np.mean(m_aim["first"][test] - m_base["first"][test]) for c in CONTROLS}
+                       / np.mean(m_aim["first"][test] - m_base["first"][test]) for c in args.controls}
                 print(f"seed {seed} block {b:2d} {method:5s} first-token shift {'removed' if reverse else 'recovered'}: "
                       + "  ".join(f"{c}={v:+.2f}" for c, v in rec.items()))
 
