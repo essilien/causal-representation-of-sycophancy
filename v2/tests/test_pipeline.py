@@ -88,6 +88,17 @@ def test_units():
     assert all(torch.allclose(a, b, atol=1e-4) for a, b in zip(das_zero_effect, batched)), "DAS self-source not no-op"
     assert not all(torch.allclose(a, b, atol=1e-4) for a, b in zip(full, batched)), "patching had no effect"
 
+    # per-item interchange (run_answer_patch): identical W_i for all items == shared-W DAS;
+    # W_i = 0 is a no-op
+    from v2.run_answer_patch import item_patch_fn
+    Wsh = torch.linalg.qr(torch.randn(lm.d_model, 2)).Q
+    with torch.no_grad():
+        shared = lm.token_logprobs(seqs, 2, patch_fn(pos, other, Wsh))
+        per_item = lm.token_logprobs(seqs, 2, item_patch_fn(pos, other, Wsh.expand(len(seqs), -1, -1)))
+        zero = lm.token_logprobs(seqs, 2, item_patch_fn(pos, other, torch.zeros(len(seqs), lm.d_model, 2)))
+    assert all(torch.allclose(a, b, atol=1e-4) for a, b in zip(shared, per_item)), "per-item W != shared W"
+    assert all(torch.allclose(a, b, atol=1e-4) for a, b in zip(zero, batched)), "W_i = 0 is not a no-op"
+
     # gradients reach W only, and only through the patched block
     sub = Subspace(lm.d_model, 4, 0)
     lp = lm.token_logprobs(seqs, 1, patch_fn(pos, other, sub()))
@@ -313,6 +324,10 @@ def test_integration(dataset_path):
         assert ("from", "pre", "answer") in vr["assert_plausible"] and ("from", "post", "after") in vr["assert_plausible"]
         assert ("from", "marker", "after") in vr["hedge_post"] and ("from", "marker", "answer") not in vr["hedge_post"]
         assert ("from", "marker", "answer") in vr["hedge_pre"] and ("from", "post", "after") not in vr["hedge_pre"]
+        from v2 import run_answer_patch
+        run(run_answer_patch, "--seeds", "0", "1")
+        ap0 = json.loads((root / "answer_patch" / "seed0" / "block01.json").read_text())
+        assert set(ap0["variants"]) == {"dir1", "dir2", "dir2_other", "dir2_on"}
         from v2 import run_answer_direction
         run(run_answer_direction, "--seeds", "0", "1", "--k", "4")
         ad = json.loads((root / "answer_direction" / "seed0.json").read_text())
@@ -379,7 +394,8 @@ def test_integration(dataset_path):
             pass
         for f in ["behavior.md", "main_k4.csv", "fig_main_k4.png", "fig_first_vs_rest_k4.png",
                   "illusion.csv", "fig_illusion.png", "tracing.csv", "fig_tracing.png",
-                  "knockout.csv", "fig_knockout.png", "behavior_contrasts.csv", "illusion_reverse.csv", "fig_illusion_reverse.png",
+                  "knockout.csv", "fig_knockout.png", "behavior_contrasts.csv",
+                  "answer_patch.csv", "fig_answer_patch.png", "illusion_reverse.csv", "fig_illusion_reverse.png",
                   "fig_tracing__mention_plausible_1__noise.png", "fig_tracing__assert_plausible__resample.png",
                   "fig_knockout__mention_plausible_1.png", "fig_condition_compare.png",
                   "fig_knockout__assert_empty_1.png", "illusion__assert_empty_2.csv",

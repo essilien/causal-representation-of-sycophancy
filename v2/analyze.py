@@ -737,6 +737,66 @@ def analyze_answer_direction(root: Path, out: Path, k=64):
     write_csv(out / "answer_direction.csv", rows)
 
 
+def analyze_answer_patch(root: Path, out: Path, k=64):
+    """Item-specific answer-direction interventions (v2/run_answer_patch.py) next to DAS (k)
+    and full patching from the illusion control (same test items): first-token shift
+    recovered. patch_specific = full patching with the matched source minus with another
+    item's neutral source (the part of full patching that depends on the item)."""
+    files = sorted((root / "answer_patch").glob("seed*/block*.json"))
+    if not files:
+        print("  answer_patch: no results yet")
+        return
+    by_block = defaultdict(list)
+    for f in files:
+        r = json.loads(f.read_text())
+        by_block[r["block"]].append(r)
+    ill = defaultdict(dict)
+    for f in sorted((root / "illusion").glob("seed*/block*.json")):
+        r = json.loads(f.read_text())
+        ill[(r["block"], r["method"])][r["seed"]] = r
+    rows = []
+    for b in sorted(by_block):
+        rs = by_block[b]
+        row = {"block": b, "n_seeds": len(rs)}
+        for v in rs[0]["variants"]:
+            t = [tuple(np.array(x, dtype=float) for x in
+                       (r["variants"][v]["m_int_first"], r["m_src_first"], r["m_neutral_first"])) for r in rs]
+            row[v], row[f"{v}_lo"], row[f"{v}_hi"], _ = boot(t, v_rec)
+        for method, ctrl, name in [("das", "matched", "das"), ("patch", "matched", "patch"),
+                                   ("patch", "other_neutral", "patch_on")]:
+            ts = [tuple(np.array(x, dtype=float) for x in
+                        (ir["controls"][ctrl]["m_int_first"], ir["m_src_first"], ir["m_neutral_first"]))
+                  for s, ir in ill.get((b, method), {}).items() if ctrl in ir["controls"]]
+            if ts:
+                row[name], row[f"{name}_lo"], row[f"{name}_hi"], _ = boot(ts, v_rec)
+        if "patch" in row and "patch_on" in row:
+            row["patch_specific"] = row["patch"] - row["patch_on"]
+        rows.append(row)
+    write_csv(out / "answer_patch.csv", rows)
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(6, 3.4))
+    x = [r["block"] for r in rows]
+    for col, label, ls in [("dir1", "own answer direction (1-d)", "-"), ("dir2", "own answer subspace (2-d)", "-"),
+                           ("dir2_other", "another item's answer subspace", ":"),
+                           ("dir2_on", "own subspace, other item's neutral source", ":"),
+                           ("das", f"DAS (k={k}, shared)", "--"), ("patch", "full patching", "--"),
+                           ("patch_specific", "full patching, item-specific part", "-.")]:
+        if col in rows[0]:
+            ax.plot(x, [r[col] for r in rows], ls, marker="o", ms=2.5, label=label)
+    ax.axhline(0, color="k", lw=0.8)
+    ax.axhline(1, color="k", lw=0.8, ls=":")
+    ax.set_xlabel("Decoder block")
+    ax.set_ylabel("First-token shift recovered")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=6.5)
+    fig.tight_layout()
+    fig.savefig(out / "fig_answer_patch.png", dpi=200)
+    plt.close(fig)
+    print(f"  wrote {out / 'fig_answer_patch.png'}")
+
+
 def analyze_probe(root: Path, out: Path):
     f = root / "probe.json"
     if not f.exists():
@@ -767,7 +827,7 @@ def main():
     ap.add_argument("--model", default="llama")
     ap.add_argument("--results-root", required=True)
     ap.add_argument("--only", nargs="+", default=["behavior", "probe", "main", "rank", "transfer", "illusion", "tracing", "knockout",
-                             "answer_direction"])
+                             "answer_direction", "answer_patch"])
     args = ap.parse_args()
     root = Path(args.results_root) / args.model
     out = root / "analysis"
@@ -777,7 +837,7 @@ def main():
         {"behavior": analyze_behavior, "probe": analyze_probe, "main": analyze_main,
          "rank": analyze_rank, "transfer": analyze_transfer, "illusion": analyze_illusion,
          "tracing": analyze_tracing, "knockout": analyze_knockout,
-         "answer_direction": analyze_answer_direction}[part](root, out)
+         "answer_direction": analyze_answer_direction, "answer_patch": analyze_answer_patch}[part](root, out)
 
 
 if __name__ == "__main__":
