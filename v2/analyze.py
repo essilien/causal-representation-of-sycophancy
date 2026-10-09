@@ -155,6 +155,28 @@ def analyze_behavior(root: Path, out: Path):
     lines += ["", "## 2x2 decomposition of the margin shift (negative = toward c_minus)", ""] + [
         f"- template {d['mention_template']} {d['component']}: {d['estimate']}" for d in dec]
 
+    # paired contrasts between conditions (same items, so the item-level difference is
+    # bootstrapped): certainty markers before vs. after the answer, against the unmarked one
+    contrasts = [(a, b) for a, b in [("hedge_post", "hedge_none"), ("sure_post", "hedge_none"),
+                                     ("hedge_pre", "hedge_none"), ("sure_pre", "hedge_none"),
+                                     ("hedge_post", "hedge_pre"), ("sure_post", "sure_pre"),
+                                     ("sure_post", "hedge_post"), ("sure_pre", "hedge_pre")]
+                 if a in conds and b in conds]
+    con = []
+    for a, b in contrasts:
+        row = {"contrast": f"{a} - {b}"}
+        for key, name in [("margin", "shift_diff"), ("margin_first", "first_token_shift_diff")]:
+            d = np.array([it[key][a] - it[key][b] for it in nc])
+            row[name] = fmt(boot_mean(d))
+        fl = np.array([float(it["margin"][a] < 0) - float(it["margin"][b] < 0) for it in nc])
+        row["flip_rate_diff_pct"] = fmt(tuple(100 * x for x in boot_mean(fl)))
+        con.append(row)
+    if con:
+        write_csv(out / "behavior_contrasts.csv", con)
+        lines += ["", "## Paired contrasts (same items; negative shift diff = more toward c_minus)", ""] + [
+            f"- {r['contrast']}: shift {r['shift_diff']}, first token {r['first_token_shift_diff']}, "
+            f"flip rate {r['flip_rate_diff_pct']} pp" for r in con]
+
     # v1-style control: correct vs. the asserted irrelevant answer itself
     both = [it for it in nc if it["margin"]["neutral__vs_r"] > 0]
     f_syc = np.array([it["margin"]["assert_plausible"] < 0 for it in both])

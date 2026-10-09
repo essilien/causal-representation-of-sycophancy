@@ -379,7 +379,7 @@ def test_integration(dataset_path):
             pass
         for f in ["behavior.md", "main_k4.csv", "fig_main_k4.png", "fig_first_vs_rest_k4.png",
                   "illusion.csv", "fig_illusion.png", "tracing.csv", "fig_tracing.png",
-                  "knockout.csv", "fig_knockout.png", "illusion_reverse.csv", "fig_illusion_reverse.png",
+                  "knockout.csv", "fig_knockout.png", "behavior_contrasts.csv", "illusion_reverse.csv", "fig_illusion_reverse.png",
                   "fig_tracing__mention_plausible_1__noise.png", "fig_tracing__assert_plausible__resample.png",
                   "fig_knockout__mention_plausible_1.png", "fig_condition_compare.png",
                   "fig_knockout__assert_empty_1.png", "illusion__assert_empty_2.csv",
