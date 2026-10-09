@@ -160,7 +160,12 @@ def analyze_behavior(root: Path, out: Path):
     contrasts = [(a, b) for a, b in [("hedge_post", "hedge_none"), ("sure_post", "hedge_none"),
                                      ("hedge_pre", "hedge_none"), ("sure_pre", "hedge_none"),
                                      ("hedge_post", "hedge_pre"), ("sure_post", "sure_pre"),
-                                     ("sure_post", "hedge_post"), ("sure_pre", "hedge_pre")]
+                                     ("sure_post", "hedge_post"), ("sure_pre", "hedge_pre"),
+                                     # same words, only the order of the two sentences differs
+                                     ("hedge_post_sep", "hedge_none"), ("sure_post_sep", "hedge_none"),
+                                     ("hedge_pre_sep", "hedge_none"), ("sure_pre_sep", "hedge_none"),
+                                     ("hedge_post_sep", "hedge_pre_sep"), ("sure_post_sep", "sure_pre_sep"),
+                                     ("sure_post_sep", "hedge_post_sep"), ("sure_pre_sep", "hedge_pre_sep")]
                  if a in conds and b in conds]
     con = []
     for a, b in contrasts:

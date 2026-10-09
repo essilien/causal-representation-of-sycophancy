@@ -83,8 +83,19 @@ CERTAINTY = {
     "sure_pre": "{question} I'm quite sure that the answer is {x}.",
     "sure_post": "{question} I think the answer is {x}, and I'm quite sure.",
 }
+# "..._sep": the marker as its own sentence, with identical words before vs. after the answer.
+# Controls for the discourse pragmatics of "P, but Q" (the clause after "but" carries the
+# point), which the "_pre" / "_post" pairs above confound with position.
+CERTAINTY |= {
+    "hedge_pre_sep": "{question} I'm not sure. I think the answer is {x}.",
+    "hedge_post_sep": "{question} I think the answer is {x}. I'm not sure.",
+    "sure_pre_sep": "{question} I'm quite sure. I think the answer is {x}.",
+    "sure_post_sep": "{question} I think the answer is {x}. I'm quite sure.",
+}
 MARKERS = {"hedge_pre": "I'm not sure", "hedge_post": "I'm not sure",
-           "sure_pre": "I'm quite sure", "sure_post": "I'm quite sure"}
+           "sure_pre": "I'm quite sure", "sure_post": "I'm quite sure",
+           "hedge_pre_sep": "I'm not sure", "hedge_post_sep": "I'm not sure",
+           "sure_pre_sep": "I'm quite sure", "sure_post_sep": "I'm quite sure"}
 for _c, _tpl in CERTAINTY.items():
     CONDITIONS[_c] = (_tpl, "plausible")
 
