@@ -25,6 +25,22 @@ from v2.data import read_jsonl
 B = 2000
 RNG = np.random.default_rng(0)
 
+# Item subgroup for `--group flip|noflip`: boolean over neutral-correct rows (cache row order),
+# True for the items kept. Every result file stores which rows it covers ("rows" or
+# "test_rows"), so all per-item analyses can be restricted to a subgroup after the fact.
+GROUP = None
+
+
+def _mask(r):
+    if GROUP is None:
+        return None
+    return GROUP[np.asarray(r["test_rows"] if "test_rows" in r else r["rows"])]
+
+
+def _sel(r, arrays):
+    m = _mask(r)
+    return arrays if m is None else [np.asarray(x)[m] for x in arrays]
+
 
 # ---- vectorized metrics over bootstrap rows [B, n] ----------------------------------------
 def v_iia(mi, ms, mn):
@@ -68,6 +84,8 @@ def boot(per_seed, fn, paired_with=None):
     pts, bs = [], []
     for s, tup in enumerate(per_seed):
         n = len(tup[0])
+        if n == 0:  # e.g. a subgroup (--group) with no items in this seed's test split
+            continue
         idx = RNG.integers(0, n, (B, n))
         val = fn(*[np.asarray(x)[None] for x in tup])[0]
         bv = fn(*[np.asarray(x)[idx] for x in tup])
@@ -77,6 +95,8 @@ def boot(per_seed, fn, paired_with=None):
             bv = bv - fn(*[np.asarray(x)[idx] for x in ot])
         pts.append(val)
         bs.append(bv)
+    if not pts:
+        return (float("nan"),) * 4
     bs = np.nanmean(np.stack(bs), axis=0)
     sd = float(np.std(pts, ddof=1)) if len(pts) > 1 else float("nan")
     return float(np.mean(pts)), float(np.nanpercentile(bs, 2.5)), float(np.nanpercentile(bs, 97.5)), sd
@@ -84,6 +104,8 @@ def boot(per_seed, fn, paired_with=None):
 
 def boot_mean(x):
     x = np.asarray(x, dtype=float)
+    if len(x) == 0:
+        return (float("nan"),) * 3
     bm = x[RNG.integers(0, len(x), (B, len(x)))].mean(1)
     return float(x.mean()), float(np.percentile(bm, 2.5)), float(np.percentile(bm, 97.5))
 
@@ -227,8 +249,8 @@ def tuples(res_by_seed, src, part=""):
     out = []
     for r in res_by_seed:
         e = r["eval"][src]
-        t = [np.array(e[f"m_int{part}"], dtype=float), np.array(e[f"m_src{part}"], dtype=float),
-             np.array(r[f"m_neutral{part}"], dtype=float)]
+        t = _sel(r, [np.array(e[f"m_int{part}"], dtype=float), np.array(e[f"m_src{part}"], dtype=float),
+                     np.array(r[f"m_neutral{part}"], dtype=float)])
         ok = np.all([np.isfinite(x) for x in t], axis=0)
         out.append(tuple(x[ok] for x in t))
     return out
@@ -488,8 +510,8 @@ def _illusion_dir(files, out, name, ylabel):
         row = {"block": b, "method": method, "n_seeds": len(rs)}
         for c in rs[0]["controls"]:
             for part, sfx in [("", ""), ("_first", "_first")]:
-                t = [(np.array(r["controls"][c][f"m_int{part}"]), np.array(r[f"m_src{part}"]),
-                      np.array(r[f"m_neutral{part}"])) for r in rs]
+                t = [tuple(_sel(r, [np.array(r["controls"][c][f"m_int{part}"]), np.array(r[f"m_src{part}"]),
+                                    np.array(r[f"m_neutral{part}"])])) for r in rs]
                 (row[f"{c}{sfx}"], row[f"{c}{sfx}_lo"], row[f"{c}{sfx}_hi"], _) = boot(t, v_rec)
                 # log-prob units: needed when the condition's own shift is small (content-free)
                 (row[f"{c}{sfx}_abs"], row[f"{c}{sfx}_abs_lo"], row[f"{c}{sfx}_abs_hi"], _) = boot(t, v_abs)
@@ -545,7 +567,7 @@ def _position_rows(runs, conditions, ref):
             for part in ["mean", "first", "rest"]:
                 ts = []
                 for r in rs:
-                    t = [arr(r, cond, part), arr(r, target, part), arr(r, base, part)]
+                    t = _sel(r, [arr(r, cond, part), arr(r, target, part), arr(r, base, part)])
                     ok = np.all([np.isfinite(x) for x in t], axis=0)
                     ts.append(tuple(x[ok] for x in t))
                 sfx = "" if part == "mean" else f"_{part}"
@@ -764,13 +786,14 @@ def analyze_answer_patch(root: Path, out: Path, k=64):
         rs = by_block[b]
         row = {"block": b, "n_seeds": len(rs)}
         for v in rs[0]["variants"]:
-            t = [tuple(np.array(x, dtype=float) for x in
-                       (r["variants"][v]["m_int_first"], r["m_src_first"], r["m_neutral_first"])) for r in rs]
+            t = [tuple(_sel(r, [np.array(x, dtype=float) for x in
+                                (r["variants"][v]["m_int_first"], r["m_src_first"], r["m_neutral_first"])]))
+                 for r in rs]
             row[v], row[f"{v}_lo"], row[f"{v}_hi"], _ = boot(t, v_rec)
         for method, ctrl, name in [("das", "matched", "das"), ("patch", "matched", "patch"),
                                    ("patch", "other_neutral", "patch_on")]:
-            ts = [tuple(np.array(x, dtype=float) for x in
-                        (ir["controls"][ctrl]["m_int_first"], ir["m_src_first"], ir["m_neutral_first"]))
+            ts = [tuple(_sel(ir, [np.array(x, dtype=float) for x in
+                                  (ir["controls"][ctrl]["m_int_first"], ir["m_src_first"], ir["m_neutral_first"])]))
                   for s, ir in ill.get((b, method), {}).items() if ctrl in ir["controls"]]
             if ts:
                 row[name], row[f"{name}_lo"], row[f"{name}_hi"], _ = boot(ts, v_rec)
@@ -827,19 +850,75 @@ def analyze_probe(root: Path, out: Path):
     print(f"  wrote {out / 'fig_probe.png'}")
 
 
+def _flip_labels(root: Path):
+    """Per neutral-correct row: does the item flip under the main assertion?"""
+    meta = json.loads((root / "behavior" / "meta.json").read_text())
+    items = read_jsonl(root / "behavior" / "items.jsonl")
+    nc = [items[i] for i in meta["nc_ids"]]
+    return nc, np.array([it["margin"][MAIN_SOURCE] < 0 for it in nc])
+
+
+def analyze_groups(root: Path, out: Path):
+    """Why do some items not follow the assertion? Behavior of flipping vs. non-flipping
+    items (flip = margin < 0 under the main assertion): prior strength (neutral margin) vs.
+    size of the shift, per condition, and flip rates by quartile of each."""
+    nc, flip = _flip_labels(root)
+    conds = [c for c in ["assert_plausible", "mention_plausible_1", "assert_irrelevant", "hedge_none"]
+             if c in nc[0]["margin"]]
+    neu = np.array([it["margin"]["neutral"] for it in nc])
+    neu_f = np.array([it["margin_first"]["neutral"] for it in nc])
+    lines = [f"# Flipping vs. non-flipping items ({MAIN_SOURCE})", "",
+             f"- flip {flip.sum()}, no flip {(~flip).sum()} of {len(nc)} neutral-correct items", ""]
+    rows = []
+    for name, m in [("flip", flip), ("noflip", ~flip)]:
+        row = {"group": name, "n": int(m.sum()),
+               "neutral_margin": fmt(boot_mean(neu[m])), "neutral_margin_first": fmt(boot_mean(neu_f[m])),
+               "trivia_qa_share_pct": f"{100 * np.mean([nc[i]['dataset'] == 'trivia_qa' for i in np.where(m)[0]]):.1f}"}
+        for c in conds:
+            d = np.array([nc[i]["margin"][c] - nc[i]["margin"]["neutral"] for i in np.where(m)[0]])
+            row[f"shift_{c}"] = fmt(boot_mean(d))
+        for key, lab in [("c_plus", "dlp_correct"), ("c_minus", "dlp_incorrect")]:
+            v = [np.mean(nc[i]["lp"][MAIN_SOURCE][key]) - np.mean(nc[i]["lp"]["neutral"][key]) for i in np.where(m)[0]]
+            row[lab] = fmt(boot_mean(v))
+        rows.append(row)
+    write_csv(out / "groups.csv", rows)
+    for r in rows:
+        lines.append(f"- {r['group']} (n={r['n']}): neutral margin {r['neutral_margin']}, "
+                     + ", ".join(f"{k} {v}" for k, v in r.items() if k.startswith(("shift_", "dlp_"))))
+    shift = np.array([it["margin"][MAIN_SOURCE] for it in nc]) - neu
+    lines += ["", f"- correlation(neutral margin, shift) = {np.corrcoef(neu, shift)[0, 1]:+.3f}", ""]
+    for name, v in [("neutral margin", neu), (f"shift under {MAIN_SOURCE}", shift)]:
+        q = np.quantile(v, [0.25, 0.5, 0.75])
+        bins = np.digitize(v, q)
+        lines.append(f"- flip rate by quartile of {name}: " + ", ".join(
+            f"Q{k + 1} {100 * flip[bins == k].mean():.1f}%" for k in range(4)))
+    (out / "groups.md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+
+
 def main():
+    global GROUP
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="llama")
     ap.add_argument("--results-root", required=True)
-    ap.add_argument("--only", nargs="+", default=["behavior", "probe", "main", "rank", "transfer", "illusion", "tracing", "knockout",
-                             "answer_direction", "answer_patch"])
+    ap.add_argument("--only", nargs="+", default=["behavior", "groups", "probe", "main", "rank", "transfer", "illusion",
+                             "tracing", "knockout", "answer_direction", "answer_patch"])
+    ap.add_argument("--group", choices=["all", "flip", "noflip"], default="all",
+                    help="restrict per-item analyses to items that do / do not flip under the main assertion "
+                         "(outputs go to analysis__<group>/)")
     args = ap.parse_args()
     root = Path(args.results_root) / args.model
     out = root / "analysis"
+    if args.group != "all":
+        _, flip = _flip_labels(root)
+        GROUP = flip if args.group == "flip" else ~flip
+        out = root / f"analysis__{args.group}"
+        # item-level parts only; behavior-level summaries are not subgroup-specific
+        args.only = [p for p in args.only if p not in ("behavior", "groups", "probe", "transfer", "answer_direction")]
     out.mkdir(exist_ok=True)
     for part in args.only:
         print(f"== {part} ==")
-        {"behavior": analyze_behavior, "probe": analyze_probe, "main": analyze_main,
+        {"behavior": analyze_behavior, "groups": analyze_groups, "probe": analyze_probe, "main": analyze_main,
          "rank": analyze_rank, "transfer": analyze_transfer, "illusion": analyze_illusion,
          "tracing": analyze_tracing, "knockout": analyze_knockout,
          "answer_direction": analyze_answer_direction, "answer_patch": analyze_answer_patch}[part](root, out)

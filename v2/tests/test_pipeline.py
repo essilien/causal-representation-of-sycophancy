@@ -352,6 +352,13 @@ def test_integration(dataset_path):
         assert n_main == 2 * 4 * 2, n_main  # seeds x blocks x {patch, das}
         sys.argv = ["x", "--results-root", tmp]
         analyze.main()
+        # the same per-item analyses restricted to items that do / do not flip
+        for grp in ["flip", "noflip"]:
+            sys.argv = ["x", "--results-root", tmp, "--group", grp]
+            analyze.main()
+            assert (root / f"analysis__{grp}" / "tracing.csv").exists(), grp
+        analyze.GROUP = None
+        assert (root / "analysis" / "groups.md").exists()
         # analyze_transfer hardcodes k=64; exercise it with the tiny rank too
         analyze.analyze_transfer(root, root / "analysis", k=4)
         analyze.analyze_main(root, root / "analysis", k=4)
