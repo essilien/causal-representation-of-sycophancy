@@ -169,6 +169,12 @@ def test_position_experiments(lm):
     _, ph = span_positions(lm, it, "hedge_post")  # ... is Christopher Marlowe, but I'm not sure.
     assert ph["answer"] == [9, 10] and ph["pre"] == [4, 5, 6, 7, 8] and ph["post"] == [11, 12, 13, 14]
     assert ph["marker"] == [12, 13, 14], ph
+    # E14 templates: nothing but "." after the answer / different words around it
+    _, pe2 = span_positions(lm, it, "assert_end_plausible")  # I think the answer is Christopher Marlowe.
+    assert pe2["answer"] == [9, 10] and pe2["post"] == [] and pe2["tmpl"] == [11], pe2  # "Marlowe." is one word here
+    _, pa = span_positions(lm, it, "assert_alt_irrelevant")  # My guess would be Paris, though I could be wrong.
+    assert pa["answer"] == [8] and pa["pre"] == [4, 5, 6, 7] and pa["post"] == [9, 10, 11, 12, 13], pa
+    assert pos["tmpl"] == pos["suffix"][:-1]
     _, pp = span_positions(lm, it, "hedge_pre")  # I'm not sure, but I think the answer is Christopher Marlowe.
     assert pp["marker"] == [4, 5, 6] and pp["post"] == [] and pp["answer"] == [13, 14], pp
     from v2.positions import AssertItem as AI
@@ -238,6 +244,39 @@ def test_position_experiments(lm):
             assert np.abs(cl - co).max() > 1e-3, "noise had no effect"
             assert np.allclose(res["restore/after_all"][part], cl, atol=1e-4), "restore != clean"
             assert np.allclose(res["remove/after_all"][part], co, atol=1e-4), "remove != corrupted"
+    # E13 head decomposition: recomputed attention matches the model, per-head direct reads
+    # add up to the attention output's projection on the answer direction, and a per-head
+    # knockout of all heads equals the all-head mask
+    from v2.run_heads import HeadRecorder, STATS, answer_dirs, head_mask, pair_seqs, record_condition
+    its = items[:3]
+    stats, _, _ = record_condition(lm, its, bs=2, log=lambda *a: None)
+    assert (stats[..., :3] >= 0).all() and (stats[..., :3].sum(-1) <= 1 + 1e-5).all()
+    A, _ = answer_dirs(lm, its)
+    outs, nin = {}, {}
+    hs = [l.self_attn.o_proj.register_forward_hook(lambda m, i, o, b=b: outs.__setitem__(b, o))
+          for b, l in enumerate(lm.layers)]
+    hs.append(lm.model.model.norm.register_forward_pre_hook(lambda m, a_: nin.__setitem__(0, a_[0])))
+    seqs = pair_seqs(its, [0, 1, 2])
+    with torch.no_grad():
+        lm.token_logprobs(seqs)
+    for h in hs:
+        h.remove()
+    p_, r_ = torch.tensor([len(x.prefix) - 1 for x in its]), torch.arange(0, 6, 2)
+    x = nin[0][r_, p_]
+    rms = (x.pow(2).mean(-1) + lm.model.model.norm.variance_epsilon).sqrt()
+    for b in range(lm.n_layers):
+        ref = ((outs[b][r_, p_] * A).sum(-1) / rms).numpy()
+        assert np.allclose(ref, stats[:, b, :, STATS.index("dla_all")].sum(-1), atol=1e-4), f"DLA mismatch at block {b}"
+    tagged, _, _ = record_condition(lm, its, bs=2, tag_ko=True, log=lambda *a: None)
+    assert np.allclose(tagged[:, 0, :, :3], stats[:, 0, :, :3], atol=1e-5), "tag knockout must not touch block-0 reads"
+    assert not np.allclose(tagged[:, -1, :, :3], stats[:, -1, :, :3], atol=1e-5)
+    T = max(len(q.prefix) + len(q.cand) for q in seqs)
+    nh = lm.model.config.num_attention_heads
+    hm = head_mask(its, [0, 1, 2], list(range(nh)), nh, T, lm.device)
+    a1, a2 = scores(lm, seqs, [1, 2], {1: hm, 2: hm}), scores(lm, seqs, [1, 2], hm.any(1, keepdim=True))
+    assert all(torch.allclose(u, v, atol=1e-5, equal_nan=True) for u, v in zip(a1, a2)), "per-head mask"
+    a3 = scores(lm, seqs, [1], {1: head_mask(its, [0, 1, 2], [0], nh, T, lm.device)})
+    assert not torch.allclose(a3[1], scores(lm, seqs)[1], atol=1e-6), "one-head knockout had no effect"
     print("position-experiment tests passed")
 
 
@@ -328,6 +367,28 @@ def test_integration(dataset_path):
         run(run_answer_patch, "--seeds", "0", "1")
         ap0 = json.loads((root / "answer_patch" / "seed0" / "block01.json").read_text())
         assert set(ap0["variants"]) == {"dir1", "dir2", "dir2_other", "dir2_on"}
+        # E14: cheap per-candidate rerun, extra tracing groups, routes on the new templates
+        run(run_knockout, "--blocks", "1,2", "--limit", "8", "--bs", "3", "--keys", "span", "--tag", "cand")
+        kc = json.loads((root / "knockout" / "assert_plausible__cand" / "block01.json").read_text())
+        assert kc["keys"] == ["span"] and "first_plus" in kc["margins"]["from/span/after"]
+        assert len(kc["m_neutral_first_plus"]) == len(kc["rows"])
+        run(run_tracing, "--blocks", "1", "--limit", "8", "--bs", "3", "--groups", "post", "tmpl", "--variant", "pp")
+        tp = json.loads((root / "tracing" / "assert_plausible__noise-pp__s0" / "block01.json").read_text())
+        assert tp["groups"] == ["post", "tmpl"] and "first_minus" in tp["margins"]["restore/post"]
+        for c in ["assert_end_irrelevant", "assert_alt_plausible"]:
+            run(run_knockout, "--blocks", "1,2", "--limit", "8", "--bs", "3", "--routes", "--condition", c)
+            run(run_tracing, "--blocks", "1", "--limit", "8", "--bs", "3", "--condition", c,
+                "--groups", "answer", "span", "suffix", "last", "pre", "post", "tmpl")
+        ve = json.loads((root / "knockout" / "assert_end_irrelevant__routes" / "block01.json").read_text())["variants"]
+        assert ["from", "post", "after"] not in ve and ["from", "pre", "answer"] in ve  # no word after the answer
+        # E13
+        from v2 import run_heads
+        run(run_heads, "--limit", "12", "--bs", "4", "--k", "3")
+        hz = np.load(root / "heads" / "assert_plausible+tag.npz")
+        assert hz["stats"].shape[1:] == (4, 4, 7) and len(hz["rows"]) == hz["stats"].shape[0]
+        hk = json.loads((root / "heads" / "knockout.json").read_text())
+        assert set(hk["heads"]) == {"top_assert_k3", "top_mention_k3", "random_k3"}
+        assert all(r % 2 == 1 for r in hk["conditions"]["assert_plausible"]["rows"])
         from v2 import run_answer_direction
         run(run_answer_direction, "--seeds", "0", "1", "--k", "4")
         ad = json.loads((root / "answer_direction" / "seed0.json").read_text())
@@ -353,7 +414,7 @@ def test_integration(dataset_path):
         sys.argv = ["x", "--results-root", tmp]
         analyze.main()
         # the same per-item analyses restricted to items that do / do not flip
-        for grp in ["flip", "noflip"]:
+        for grp in ["flip", "noflip", "firsttok"]:
             sys.argv = ["x", "--results-root", tmp, "--group", grp]
             analyze.main()
             assert (root / f"analysis__{grp}" / "tracing.csv").exists(), grp
@@ -369,11 +430,17 @@ def test_integration(dataset_path):
         import csv
         tr = list(csv.DictReader(open(root / "analysis" / "tracing.csv")))
         assert {r["config"] for r in tr} == {"assert_plausible__noise", "mention_plausible_1__noise",
-                                             "assert_plausible__resample", "mention_empty_1__noise"}
+                                             "assert_plausible__resample", "mention_empty_1__noise",
+                                             "assert_plausible__noise-pp", "assert_end_irrelevant__noise",
+                                             "assert_alt_plausible__noise"}
+        assert "restore_post_first_minus" in next(r for r in tr if r["config"] == "assert_plausible__noise-pp")
         assert {r["n_seeds"] for r in tr if r["config"] == "assert_plausible__noise"} == {"2"}  # s0 + s1 pooled
         ko = list(csv.DictReader(open(root / "analysis" / "knockout.csv")))
         assert {r["config"] for r in ko} == {"assert_plausible", "mention_plausible_1", "assert_empty_1",
-                                             "assert_plausible__routes", "hedge_post__routes", "hedge_pre__routes"}
+                                             "assert_plausible__routes", "hedge_post__routes", "hedge_pre__routes",
+                                             "assert_plausible__cand", "assert_end_irrelevant__routes",
+                                             "assert_alt_plausible__routes"}
+        assert "from_span_after_first_plus" in next(r for r in ko if r["config"] == "assert_plausible__cand")
         assert "shift_first_abs" in ko[0]
         row = next(csv.DictReader(open(root / "analysis" / "main_k4.csv")))
         for col in ["das_iia_seed_sd", "diff_iia_seed_sd", "das_shift_recovered_first", "das_shift_r",
@@ -408,7 +475,9 @@ def test_integration(dataset_path):
                   "fig_knockout__assert_empty_1.png", "illusion__assert_empty_2.csv",
                   "illusion_reverse__assert_empty_2.csv", "answer_direction.csv",
                   "fig_knockout__assert_plausible__routes.png", "fig_knockout__hedge_post__routes.png",
-                  "rank.csv", "transfer_k4.csv",
+                  "rank.csv", "transfer_k4.csv", "scoring.md", "heads.md", "heads_by_block.csv",
+                  "heads_amplification.csv", "heads_knockout.csv", "fig_heads.png",
+                  "fig_knockout_candidates__assert_plausible__cand.png",
                   "subspace_overlap_k4.csv", "fig_probe.png", "table_main_k4.tex"]:
             assert f in produced, f"missing {f}"
     print("integration test passed")

@@ -549,7 +549,14 @@ def v_abs(mi, ms, mn):
     return (mi - mn).mean(-1)
 
 
-def _position_rows(runs, conditions, ref):
+def _cand_parts(runs):
+    """Per-candidate first-token parts, if the runs stored them (newer run_knockout/run_tracing)."""
+    r = next(iter(runs.values()))[0]
+    ok = "m_neutral_first_plus" in r and "first_plus" in next(iter(r["margins"].values()))
+    return ["first_plus", "first_minus"] if ok else []
+
+
+def _position_rows(runs, conditions, ref, parts=("mean", "first", "rest")):
     """runs: block -> list of result dicts (one per seed / noise draw). One row per block:
     for each column, v_rec(m_cond, m_target, m_base) and its absolute counterpart with
     item-bootstrap CIs (seeds averaged, see boot), per margin part. `conditions` maps a
@@ -564,7 +571,7 @@ def _position_rows(runs, conditions, ref):
             return np.array(r[ref[name] + sfx] if name in ref else r["margins"][name][part], dtype=float)
         row = {"block": b, "n_items": len(rs[0]["rows"]), "n_seeds": len(rs)}
         for col, (cond, target, base) in conditions.items():
-            for part in ["mean", "first", "rest"]:
+            for part in parts:
                 ts = []
                 for r in rs:
                     t = _sel(r, [arr(r, cond, part), arr(r, target, part), arr(r, base, part)])
@@ -637,7 +644,7 @@ def analyze_tracing(root: Path, out: Path):
         conds = {"corruption_strength": ("corr", "neutral", "clean")}
         conds |= {f"restore_{g}": (f"restore/{g}", "clean", "corr") for g in groups}
         conds |= {f"remove_{g}": (f"remove/{g}", "corr", "clean") for g in groups}
-        rows = _position_rows(runs, conds, {"neutral": "m_neutral"})
+        rows = _position_rows(runs, conds, {"neutral": "m_neutral"}, ("mean", "first", "rest", *_cand_parts(runs)))
         all_rows[cfg] = rows
         sfx = "" if cfg == LEGACY_TAG.rsplit("__s", 1)[0] else f"__{cfg}"
         _plot_positions(rows, [(f"Restore clean state (sufficiency)", [(f"restore_{g}", g) for g in groups]),
@@ -664,7 +671,10 @@ def analyze_knockout(root: Path, out: Path):
             [(w, k, q) for w in WINDOWS for k in keys for q in QUERIES]
         conds = {f"{w}_{k}_{q}": (f"{w}/{k}/{q}", "neutral", "biased") for w, k, q in variants}
         conds["shift"] = ("biased", "neutral", "neutral")  # absolute shift: mean(m_cond - m_neutral)
-        rows = _position_rows(runs, conds, {"neutral": "m_neutral"})
+        cand = _cand_parts(runs)
+        rows = _position_rows(runs, conds, {"neutral": "m_neutral"}, ("mean", "first", "rest", *cand))
+        if cand:
+            _plot_candidates(rows, [v for v in variants if v[0] == "from"], out / f"fig_knockout_candidates__{cfg}.png", cfg)
         for r in rows:  # `shift` is only meaningful in log-prob units (its fraction is x/0)
             for k in [k for k in r if k.startswith("shift") and "_abs" not in k]:
                 del r[k]
@@ -684,13 +694,41 @@ def analyze_knockout(root: Path, out: Path):
         _plot_condition_compare(comparable, analyze_tracing_rows(root), out / "fig_condition_compare.png")
 
 
+def _plot_candidates(rows, variants, path, cfg):
+    """Knockout from block b: fraction of the drop of c_plus and of the rise of c_minus (first
+    token) that is eliminated. Separates when the assertion's effect on the model's own answer
+    and on the asserted answer is read."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    x = [r["block"] for r in rows]
+    fig, axes = plt.subplots(1, len(variants), figsize=(4 * len(variants), 3.2), squeeze=False)
+    for ax, (w, k, q) in zip(axes[0], variants):
+        col = f"{w}_{k}_{q}"
+        for part, lab in [("first_plus", "drop of c+"), ("first_minus", "rise of c-"), ("first", "margin")]:
+            ax.plot(x, [r[f"{col}_{part}"] for r in rows], marker="o", ms=2.5, label=lab)
+            ax.fill_between(x, [r[f"{col}_{part}_lo"] for r in rows], [r[f"{col}_{part}_hi"] for r in rows],
+                            alpha=0.12, lw=0)
+        ax.axhline(0, color="k", lw=0.8)
+        ax.axhline(1, color="k", lw=0.8, ls=":")
+        ax.set_title(f"{cfg}: {q} -/-> {k} from b", fontsize=9)
+        ax.set_xlabel("Decoder block")
+        ax.grid(alpha=0.3)
+    axes[0, 0].set_ylabel("fraction eliminated")
+    axes[0, 0].legend(fontsize=7)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
 def analyze_tracing_rows(root):
     """Noise-tracing rows per condition (seeds pooled), without writing files."""
     from v2.run_tracing import LEGACY_TAG
     configs = _load_position_runs(root, "tracing", LEGACY_TAG, lambda t: t.rsplit("__s", 1)[0])
     out = {}
     for cfg, runs in configs.items():
-        cond, corruption = cfg.split("__")
+        cond, corruption = cfg.split("__", 1)
         if corruption == "noise":
             out[cond] = _position_rows(runs, {"restore_last": ("restore/last", "clean", "corr")},
                                        {"neutral": "m_neutral"})
@@ -896,35 +934,245 @@ def analyze_groups(root: Path, out: Path):
     print("\n".join(lines))
 
 
+# ---- scoring rules ------------------------------------------------------------------------
+def decision_scores(lp):
+    """(margin, s(c_plus), s(c_minus)) at the first token where the candidates differ. Up to
+    there they share their tokens, so their teacher-forced log-probs are identical; equal
+    stored log-probs are taken as the same token. NaN if one candidate is a prefix of the other."""
+    a, b = lp["c_plus"], lp["c_minus"]
+    for x, y in zip(a, b):
+        if x != y:
+            return x - y, x, y
+    return (np.nan,) * 3
+
+
+def _scores(lp, rule):
+    if rule == "mean":
+        a, b = np.mean(lp["c_plus"]), np.mean(lp["c_minus"])
+        return a - b, a, b
+    if rule == "first":
+        a, b = lp["c_plus"][0], lp["c_minus"][0]
+        return a - b, a, b
+    return decision_scores(lp)
+
+
+SCORING_CONDS = ["assert_plausible", "assert_irrelevant", "mention_plausible_1", "assert_end_plausible",
+                 "assert_end_irrelevant", "assert_alt_plausible", "assert_alt_irrelevant"]
+
+
+def analyze_scoring(root: Path, out: Path):
+    """Does a behavioral conclusion depend on how a multi-token answer is scored? Mean
+    log-prob over the answer tokens, first token, and the first token where c_plus and c_minus
+    differ (the decision token; candidates sharing a first token, e.g. "The ...", have a
+    first-token margin of 0). Each rule uses the neutral-correct items whose neutral margin
+    under that rule is positive. Per condition: flip rate, shift, and its split into the
+    change of s(c_plus) and of s(c_minus); for the main assertion also the quartiles of the
+    neutral margin and the fit m_assert = alpha * m_neutral + beta."""
+    nc, _ = _flip_labels(root)
+    conds = [c for c in SCORING_CONDS if c in nc[0]["lp"]]
+    lines, rows = ["# Scoring rules", ""], []
+    for rule in ["mean", "first", "decision"]:
+        N = np.array([_scores(it["lp"]["neutral"], rule) for it in nc])
+        keep = np.isfinite(N[:, 0]) & (N[:, 0] > 0)
+        lines += [f"## {rule} (n = {keep.sum()} of {len(nc)})", ""]
+        for c in conds:
+            X = np.array([_scores(it["lp"][c], rule) for it in nc])
+            ok = keep & np.isfinite(X[:, 0])
+            d = X[ok] - N[ok]
+            row = {"rule": rule, "condition": c, "n": int(ok.sum()),
+                   "flip_rate": fmt(wilson(int((X[ok, 0] < 0).sum()), int(ok.sum())), True),
+                   "shift": fmt(boot_mean(d[:, 0])), "d_lp_correct": fmt(boot_mean(d[:, 1])),
+                   "d_lp_incorrect": fmt(boot_mean(d[:, 2])),
+                   "shifted_toward_c_minus_pct": f"{100 * np.mean(d[:, 0] < 0):.1f}"}
+            rows.append(row)
+            lines.append(f"- {c}: flip {row['flip_rate']}%, shift {row['shift']}, dlp(c+) {row['d_lp_correct']}, "
+                         f"dlp(c-) {row['d_lp_incorrect']}, shifted toward c- {row['shifted_toward_c_minus_pct']}%")
+        for c in [c for c in conds if c.endswith("_irrelevant")]:
+            pc = c.replace("_irrelevant", "_plausible")
+            X, Y = (np.array([_scores(it["lp"][k], rule) for it in nc]) for k in (c, pc))
+            ok = keep & np.isfinite(X[:, 0]) & np.isfinite(Y[:, 0])
+            lines.append(f"- shift({c}) / shift({pc}) = {np.mean(X[ok, 0] - N[ok, 0]) / np.mean(Y[ok, 0] - N[ok, 0]):.2f}")
+        X = np.array([_scores(it["lp"][MAIN_SOURCE], rule) for it in nc])
+        ok = keep & np.isfinite(X[:, 0])
+        n0, m1 = N[ok], X[ok]
+        alpha, beta = np.polyfit(n0[:, 0], m1[:, 0], 1)
+        r2 = np.corrcoef(n0[:, 0], m1[:, 0])[0, 1] ** 2
+        lines += ["", f"- {MAIN_SOURCE}: m_assert = {alpha:.2f} * m_neutral {beta:+.2f}, R^2 = {r2:.2f}",
+                  "- by quartile of the neutral margin: m_neutral | s(c+) | s(c-) | shift | ds(c+) | ds(c-) | flip"]
+        q = np.quantile(n0[:, 0], [0.25, 0.5, 0.75])
+        bins = np.digitize(n0[:, 0], q)
+        for k in range(4):
+            m = bins == k
+            dd = m1[m] - n0[m]
+            lines.append(f"  - Q{k + 1}: {n0[m, 0].mean():.2f} | {n0[m, 1].mean():.2f} | {n0[m, 2].mean():.2f} | "
+                         f"{dd[:, 0].mean():.2f} | {dd[:, 1].mean():.2f} | {dd[:, 2].mean():.2f} | "
+                         f"{100 * np.mean(m1[m, 0] < 0):.0f}%")
+        lines.append("")
+    write_csv(out / "scoring.csv", rows)
+    (out / "scoring.md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+
+
+# ---- E13: attention heads -------------------------------------------------------------------
+def _heads_load(root):
+    d = root / "heads"
+    out = {}
+    for f in sorted(d.glob("*.npz")) if d.exists() else []:
+        z = np.load(f)
+        stats, rows = z["stats"], z["rows"]
+        if GROUP is not None:
+            m = GROUP[rows]
+            stats, rows = stats[m], rows[m]
+        out[f.stem] = {"stats": stats, "rows": rows, "names": list(z["stats_names"])}
+    return out
+
+
+def analyze_heads(root: Path, out: Path, k=10):
+    """E13 (v2/run_heads.py). (1) Per block, the direct contribution of all heads' reads of
+    the answer / pre / post tokens to the first-token logit difference. (2) Are the heads that
+    read an asserted answer the ones that read a mentioned one (per-head means, second half
+    of the network)? (3) On the top-k heads (selected on even rows, evaluated on odd rows):
+    is the assertion's larger read due to more attention to the answer, or to more read per
+    unit of attention? (4) Head knockout: shift eliminated per head set."""
+    from v2.run_heads import select_heads
+    H = _heads_load(root)
+    if not H:
+        print("  heads: no results yet")
+        return
+    names = next(iter(H.values()))["names"]
+    L = next(iter(H.values()))["stats"].shape[1]
+    j = {n: i for i, n in enumerate(names)}
+    lines = ["# Attention heads at the last prompt token (E13)", ""]
+    # (1) per block
+    rows = []
+    for c, h in H.items():
+        for b in range(L):
+            row = {"condition": c, "block": b}
+            for st in ["dla_answer", "dla_pre", "dla_post", "dla_all", "attn_answer"]:
+                x = h["stats"][:, b, :, j[st]].sum(-1)
+                row[st], row[f"{st}_lo"], row[f"{st}_hi"] = boot_mean(x[np.isfinite(x)])
+            rows.append(row)
+    write_csv(out / "heads_by_block.csv", rows)
+    # (2) head overlap
+    late = slice(L // 2, L)
+    mean_head = {c: np.nanmean(h["stats"][:, late, :, j["dla_answer"]], axis=0).ravel() for c, h in H.items()}
+    ref = "assert_plausible"
+    if ref in mean_head:
+        lines += [f"## Heads reading the answer (blocks {L // 2}-{L - 1}): correlation with {ref}", ""]
+        top = lambda v: set(np.argsort(v)[::-1][:k])
+        for c, v in mean_head.items():
+            if c in (ref, "neutral"):
+                continue
+            r = np.corrcoef(mean_head[ref], v)[0, 1]
+            lines.append(f"- {c}: r = {r:.3f}, top-{k} overlap {len(top(mean_head[ref]) & top(v))}/{k}")
+        lines.append("")
+    # (3) amplification on the top-k heads
+    if ref in H:
+        heads = select_heads(H[ref]["stats"], H[ref]["rows"], k)
+        bi, hi = np.array([b for b, _ in heads]), np.array([h for _, h in heads])
+        lines += [f"## Top-{k} heads by {ref} (even rows): {heads}", "",
+                  "Odd rows; per item summed over these heads: attention to the answer, direct read "
+                  "of the answer (logit-difference units), read per unit of attention (pooled).", ""]
+        amp = []
+        for c, h in H.items():
+            if c == "neutral":
+                continue
+            odd = h["rows"] % 2 == 1
+            S = h["stats"][odd][:, bi, hi]  # [n, k, stats]
+            att, dla = S[..., j["attn_answer"]].sum(-1), S[..., j["dla_answer"]].sum(-1)
+            ok = np.isfinite(dla)
+            att, dla = att[ok], dla[ok]
+            idx = RNG.integers(0, len(att), (B, len(att)))
+            ratio = dla.sum() / att.sum()
+            rb = dla[idx].sum(1) / att[idx].sum(1)
+            row = {"condition": c, "n": int(ok.sum()), "attn_answer": fmt(boot_mean(att)),
+                   "dla_answer": fmt(boot_mean(dla)),
+                   "dla_per_attn": f"{ratio:+.3f} [{np.percentile(rb, 2.5):+.3f}, {np.percentile(rb, 97.5):+.3f}]"}
+            amp.append(row)
+            lines.append(f"- {c}: attention {row['attn_answer']}, read {row['dla_answer']}, per attention {row['dla_per_attn']}")
+        write_csv(out / "heads_amplification.csv", amp)
+        lines.append("")
+    # (4) head knockout
+    f = root / "heads" / "knockout.json"
+    if f.exists():
+        ko = json.loads(f.read_text())
+        lines += ["## Head knockout (last token -/-> answer for the set's heads; odd rows)", ""]
+        kor = []
+        for c, res in ko["conditions"].items():
+            r_ = {"rows": res["rows"]}
+            for name in ko["heads"]:
+                row = {"condition": c, "heads": name}
+                t = _sel(r_, [np.array(res[name]["first"]), np.array(res["m_neutral_first"]),
+                              np.array(res["biased"]["first"])])
+                row["eliminated"], row["lo"], row["hi"], _ = boot([tuple(t)], v_rec)
+                kor.append(row)
+                lines.append(f"- {c} / {name}: {row['eliminated']:+.2f} [{row['lo']:+.2f}, {row['hi']:+.2f}]")
+        write_csv(out / "heads_knockout.csv", kor)
+    _plot_heads(rows, mean_head, out / "fig_heads.png")
+    (out / "heads.md").write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+
+
+def _plot_heads(rows, mean_head, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(1, 3, figsize=(13, 3.6))
+    conds = sorted({r["condition"] for r in rows})
+    for ax, st in zip(axes[:2], ["dla_answer", "dla_post"]):
+        for c in conds:
+            rr = [r for r in rows if r["condition"] == c]
+            ax.plot([r["block"] for r in rr], [r[st] for r in rr], marker="o", ms=2, label=c)
+        ax.axhline(0, color="k", lw=0.8)
+        ax.set_title(f"sum over heads: {st}", fontsize=9)
+        ax.set_xlabel("Decoder block")
+        ax.grid(alpha=0.3)
+    axes[0].legend(fontsize=6)
+    if "assert_plausible" in mean_head and "mention_plausible_1" in mean_head:
+        axes[2].scatter(mean_head["mention_plausible_1"], mean_head["assert_plausible"], s=4)
+        axes[2].set_xlabel("mention: mean dla_answer per head")
+        axes[2].set_ylabel("assertion")
+        axes[2].grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+    print(f"  wrote {path}")
+
+
 def main():
     global GROUP
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="llama")
     ap.add_argument("--results-root", required=True)
     ap.add_argument("--only", nargs="+", default=["behavior", "groups", "probe", "main", "rank", "transfer", "illusion",
-                             "tracing", "knockout", "answer_direction", "answer_patch"])
-    ap.add_argument("--group", choices=["all", "flip", "noflip", "conf_low", "conf_high"], default="all",
+                             "tracing", "knockout", "answer_direction", "answer_patch", "scoring", "heads"])
+    ap.add_argument("--group", choices=["all", "flip", "noflip", "conf_low", "conf_high", "firsttok"], default="all",
                     help="restrict per-item analyses to items that do / do not flip under the main assertion, "
                          "or to the lower / upper half of the neutral margin (prior confidence; unlike the "
-                         "flip split, not selected on the outcome). Outputs go to analysis__<group>/")
+                         "flip split, not selected on the outcome), or to the items whose first-token "
+                         "neutral margin is positive (firsttok: excludes candidates sharing their first "
+                         "token, whose first-token shift is 0). Outputs go to analysis__<group>/")
     args = ap.parse_args()
     root = Path(args.results_root) / args.model
     out = root / "analysis"
     if args.group != "all":
         nc, flip = _flip_labels(root)
         neu = np.array([it["margin"]["neutral"] for it in nc])
+        neu_first = np.array([it["margin_first"]["neutral"] for it in nc])
         GROUP = {"flip": flip, "noflip": ~flip, "conf_low": neu <= np.median(neu),
-                 "conf_high": neu > np.median(neu)}[args.group]
+                 "conf_high": neu > np.median(neu), "firsttok": neu_first > 0}[args.group]
         out = root / f"analysis__{args.group}"
         # item-level parts only; behavior-level summaries are not subgroup-specific
-        args.only = [p for p in args.only if p not in ("behavior", "groups", "probe", "transfer", "answer_direction")]
+        args.only = [p for p in args.only if p not in ("behavior", "groups", "probe", "transfer", "answer_direction",
+                                                       "scoring")]
     out.mkdir(exist_ok=True)
     for part in args.only:
         print(f"== {part} ==")
         {"behavior": analyze_behavior, "groups": analyze_groups, "probe": analyze_probe, "main": analyze_main,
          "rank": analyze_rank, "transfer": analyze_transfer, "illusion": analyze_illusion,
          "tracing": analyze_tracing, "knockout": analyze_knockout,
-         "answer_direction": analyze_answer_direction, "answer_patch": analyze_answer_patch}[part](root, out)
+         "answer_direction": analyze_answer_direction, "answer_patch": analyze_answer_patch,
+         "scoring": analyze_scoring, "heads": analyze_heads}[part](root, out)
 
 
 if __name__ == "__main__":

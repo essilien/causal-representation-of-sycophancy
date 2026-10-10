@@ -13,6 +13,7 @@ For assert_plausible, "{question} I think the answer is {c_minus} but I'm really
   pre     : framing tokens before the answer (the answer tokens can attend to these)
   post    : framing tokens after the answer (only later positions can attend to these)
   marker  : tokens of the certainty phrase of config.MARKERS (e.g. "I'm not sure"), if any
+  tmpl    : suffix without the last token (end-of-turn and assistant-header tokens)
 
 Content-free conditions (config.CONTENT_FREE) insert no answer: `answer` is empty and the
 whole inserted sentence counts as `framing`.
@@ -29,6 +30,7 @@ import numpy as np
 from v2.config import CONDITIONS, MARKERS, build_prompt
 
 GROUPS = ["answer", "framing", "span", "suffix", "last"]
+ALL_GROUPS = GROUPS + ["pre", "post", "tmpl", "marker"]
 
 
 @dataclass
@@ -90,7 +92,8 @@ def span_positions(lm, item: dict, cond: str = "assert_plausible", x: str | None
         m1 = m0 + len(MARKERS[cond])
         marker = [i for i in span if offs[i] is not None and offs[i][0] < m1 and offs[i][1] > m0]
     return ids, {"answer": answer, "framing": framing, "span": span, "suffix": suffix,
-                 "last": [len(ids) - 1], "pre": pre, "post": post, "marker": marker}
+                 "last": [len(ids) - 1], "pre": pre, "post": post, "marker": marker,
+                 "tmpl": suffix[:-1]}
 
 
 def assertion_positions(lm, item: dict):

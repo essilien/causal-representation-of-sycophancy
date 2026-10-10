@@ -24,8 +24,14 @@ late blocks, while `span` (or `answer`) carries the effect through the middle bl
 Conditions other than assert_plausible (e.g. mention_plausible_1) test whether the same
 pathway carries a mere mention of the answer, i.e. contextual entrainment.
 
+--groups may add pre / post / tmpl / marker (positions.ALL_GROUPS); --variant names such a
+run so it does not collide with the default groups of the same condition:
+tracing/<condition>__<corruption>-<variant>__s<seed>/. Items lacking a group (e.g. no `post`
+token) get NaN for it.
+
 Outputs <results>/<model>/tracing/<condition>__<corruption>__s<seed>/block*.json with
-per-item margins (mean / first / rest); see positions.run_dir for the first run's location.
+per-item margins (mean / first / rest) and first-token log-probs of c_plus / c_minus;
+see positions.run_dir for the first run's location.
 """
 import argparse
 import json
@@ -36,11 +42,12 @@ import numpy as np
 import torch
 
 from v2.config import MODELS
-from v2.das import pair_margins
+from v2.das import PARTS, pair_scores
 from v2.data import read_jsonl, write_json
 from v2.lm import LM, Seq
-from v2.positions import GROUPS, assert_items, run_dir
+from v2.positions import ALL_GROUPS, GROUPS, assert_items, run_dir
 from v2.run_intervention import chunk, parse_blocks, per_token_margins
+from v2.run_knockout import first_token_lps
 
 DIRECTIONS = ["restore", "remove"]
 LEGACY_TAG = "assert_plausible__noise__s0"
@@ -142,20 +149,25 @@ def run_block(lm, items, b, groups, scale, seed, bs, corruption="noise"):
         states = {"clean": record(lm, prefixes, b, rr, rc, (None, None, None)),
                   "corr": record(lm, corr_prefixes, b, rr, rc, prompt_noise)}
         with torch.no_grad():
-            res["clean"].append(pair_margins(lm.token_logprobs(seqs)))
+            res["clean"].append(pair_scores(lm.token_logprobs(seqs)))
             with embed_noise(lm, *pair_noise):
-                res["corr"].append(pair_margins(lm.token_logprobs(corr_seqs)))
+                res["corr"].append(pair_scores(lm.token_logprobs(corr_seqs)))
             for g in groups:
                 rows, cols, sel = pair_index(items, idx, g, where, dev)
                 with embed_noise(lm, *pair_noise):  # restore: corrupted run, clean state at (b, G)
-                    res[f"restore/{g}"].append(pair_margins(
+                    res[f"restore/{g}"].append(pair_scores(
                         lm.token_logprobs(corr_seqs, b, set_fn(rows, cols, states["clean"][sel]))))
-                res[f"remove/{g}"].append(pair_margins(  # remove: clean run, corrupted state
+                res[f"remove/{g}"].append(pair_scores(  # remove: clean run, corrupted state
                     lm.token_logprobs(seqs, b, set_fn(rows, cols, states["corr"][sel]))))
     out = {}
     for key, parts in res.items():
-        out[key] = {name: torch.cat([p[j] for p in parts]).cpu().numpy().tolist()
-                    for j, name in enumerate(["mean", "first", "rest"])}
+        g = key.split("/")[-1]
+        missing = [i for i, it in enumerate(items) if "/" in key and not it.pos[g]]
+        out[key] = {}
+        for j, name in enumerate(PARTS):
+            v = torch.cat([p[j] for p in parts]).cpu().numpy()
+            v[missing] = np.nan
+            out[key][name] = v.tolist()
     return out
 
 
@@ -171,7 +183,8 @@ def main():
     ap.add_argument("--results-root", required=True)
     ap.add_argument("--blocks", default="all")
     ap.add_argument("--chunk", default=None)
-    ap.add_argument("--groups", nargs="+", default=GROUPS, choices=GROUPS)
+    ap.add_argument("--groups", nargs="+", default=GROUPS, choices=ALL_GROUPS)
+    ap.add_argument("--variant", default=None, help="run name suffix for non-default --groups")
     ap.add_argument("--condition", default="assert_plausible", help="prompt condition with an inserted answer")
     ap.add_argument("--corruption", choices=["noise", "resample"], default="noise")
     ap.add_argument("--noise-mult", type=float, default=3.0)
@@ -193,7 +206,7 @@ def main():
     scale = noise_scale(lm, items, args.noise_mult)
     # content-free conditions have no answer tokens: drop groups that are empty everywhere
     args.groups = [g for g in args.groups if any(it.pos[g] for it in items)]
-    tag = f"{args.condition}__{args.corruption}__s{args.seed}"
+    tag = f"{args.condition}__{args.corruption}{'-' + args.variant if args.variant else ''}__s{args.seed}"
     out_dir = run_dir(root, "tracing", tag, LEGACY_TAG)
     out_dir.mkdir(parents=True, exist_ok=True)
     blocks = chunk(parse_blocks(args.blocks, lm.n_layers), args.chunk)
@@ -202,7 +215,8 @@ def main():
               "rows": rows, "noise_scale": scale, "noise_mult": args.noise_mult,
               "seed": args.seed, "groups": args.groups,
               **{f"m_neutral{s}": neu[p][rows].tolist() for p, s in [("mean", ""), ("first", "_first"), ("rest", "_rest")]},
-              **{f"m_biased_behavior{s}": bia[p][rows].tolist() for p, s in [("mean", ""), ("first", "_first"), ("rest", "_rest")]}}
+              **{f"m_biased_behavior{s}": bia[p][rows].tolist() for p, s in [("mean", ""), ("first", "_first"), ("rest", "_rest")]},
+              **first_token_lps(nc, rows, "neutral", "m_neutral")}
     for b in blocks:
         f = out_dir / f"block{b:02d}.json"
         if f.exists():
@@ -214,7 +228,9 @@ def main():
         for d in DIRECTIONS:
             for g in args.groups:
                 m = np.array(res[f"{d}/{g}"]["first"])
-                frac = np.mean(m - co) / np.mean(cl - co) if d == "restore" else np.mean(m - cl) / np.mean(co - cl)
+                ok = np.isfinite(m)
+                frac = (np.mean((m - co)[ok]) / np.mean((cl - co)[ok]) if d == "restore"
+                        else np.mean((m - cl)[ok]) / np.mean((co - cl)[ok]))
                 msg.append(f"{d[:3]}/{g}={frac:+.2f}")
         print(f"block {b:2d} (first token): " + "  ".join(msg))
 

@@ -28,19 +28,24 @@ mere mention of the answer is read through the same attention pathway (entrainme
   (e.g. answer -> post) or whose positions are empty are dropped per condition. Results
   go to knockout/<condition>__routes/.
 
+--keys restricts the keys of the standard variants (e.g. `--keys span` for a cheap rerun);
+--tag adds a suffix to the output folder (knockout/<condition>__<tag>/).
+
 Outputs <results>/<model>/knockout/<condition>/block*.json with per-item margins
-(mean / first / rest); see positions.run_dir for the first run's location.
+(mean / first / rest) and the first-token log-probs of c_plus / c_minus (first_plus /
+first_minus); see positions.run_dir for the first run's location.
 """
 import argparse
 import json
 from contextlib import contextmanager
+from functools import partial
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from v2.config import MODELS
-from v2.das import pair_margins
+from v2.das import PARTS, pair_scores
 from v2.data import read_jsonl, write_json
 from v2.lm import LM, Seq
 from v2.positions import assert_items, run_dir
@@ -55,22 +60,35 @@ ROUTE_VARIANTS = [(w, k, q) for w in WINDOWS
                                ("marker", "answer"), ("marker", "after")]]
 
 
+def first_token_lps(nc, rows, cond, name):
+    """Behavior-stage first-token log-probs of c_plus / c_minus under `cond`, as stored
+    reference arrays (<name>_first_plus / <name>_first_minus) for the per-candidate split."""
+    return {f"{name}_first_{s}": [nc[r]["lp"][cond][k][0] for r in rows]
+            for s, k in [("plus", "c_plus"), ("minus", "c_minus")]}
+
+
 def query_positions(it, query, cand_len):
     if query == "answer":
         return list(it.pos["answer"])
+    if query == "last":
+        return list(it.pos["last"])
     q0 = it.pos["suffix"][0]
     q1 = len(it.prefix) if query == "suffix" else len(it.prefix) + cand_len
     return list(range(q0, q1))
 
 
-def variant_possible(items, key, query):
-    """Every item has key and query positions, and some query can attend to some key."""
-    for it in items:
-        k = it.pos[key]
-        qs = query_positions(it, query, 1)
-        if not k or not qs or min(k) >= max(qs):
-            return False
-    return True
+def item_has_variant(it, key, query):
+    """The item has key and query positions, and some query can attend to some key."""
+    k = it.pos[key]
+    qs = query_positions(it, query, 1)
+    return bool(k) and bool(qs) and min(k) < max(qs)
+
+
+def variant_possible(items, key, query, min_frac=0.9):
+    """The variant exists for at least `min_frac` of the items (e.g. assert_end has no
+    `post` group when the final "." merges with the answer's last token). Items without it
+    get NaN margins for that variant (see run_block)."""
+    return np.mean([item_has_variant(it, key, query) for it in items]) >= min_frac
 
 
 def blocked(items, idx, key, query, T, device):
@@ -79,6 +97,8 @@ def blocked(items, idx, key, query, T, device):
     m = torch.zeros(2 * len(idx), 1, T, T, dtype=torch.bool)
     for r, i in enumerate(idx):
         it = items[i]
+        if not item_has_variant(it, key, query):
+            continue
         k = torch.tensor(it.pos[key])  # explicit list: `framing` has a gap where the answer is
         for j, cand in enumerate((it.c_plus, it.c_minus)):
             qs = torch.tensor(query_positions(it, query, len(cand)))
@@ -89,14 +109,18 @@ def blocked(items, idx, key, query, T, device):
 @contextmanager
 def knockout(lm, layers, block_mask, pad_mask):
     """Removes the blocked entries from the attention mask of every block in `layers`.
+    block_mask: [B, 1 or n_heads, T, T] bool (True = blocked), the same for every block, or a
+    dict block -> such a mask (per-head knockouts differ between blocks).
     The mask reaching the attention modules is boolean (True = attend; transformers 5) or
     additive float (older versions), or None when the batch has no padding, in which case
     the causal + padding mask is rebuilt here."""
-    T = block_mask.shape[-1]
-    causal = torch.ones(T, T, dtype=torch.bool, device=block_mask.device).tril()
+    masks = block_mask if isinstance(block_mask, dict) else {b: block_mask for b in layers}
+    any_mask = next(iter(masks.values()))
+    T = any_mask.shape[-1]
+    causal = torch.ones(T, T, dtype=torch.bool, device=any_mask.device).tril()
     default = causal[None, None] & pad_mask[:, None, None, :].bool()
 
-    def pre(mod, args, kwargs):
+    def pre(mod, args, kwargs, block_mask=None):
         if "attention_mask" not in kwargs:
             raise RuntimeError("attention module was not called with an attention_mask kwarg")
         am = kwargs["attention_mask"]
@@ -106,10 +130,11 @@ def knockout(lm, layers, block_mask, pad_mask):
             raise RuntimeError(f"attention mask shape {tuple(am.shape)} != {tuple(block_mask.shape)}")
         if am.dtype == torch.bool:
             kwargs["attention_mask"] = am & ~block_mask
-        else:  # additive float mask (older transformers)
-            kwargs["attention_mask"] = am.masked_fill(block_mask, torch.finfo(am.dtype).min)
+        else:  # additive float mask (older transformers); where() broadcasts a per-head mask
+            kwargs["attention_mask"] = torch.where(block_mask, torch.finfo(am.dtype).min, am)
         return args, kwargs
-    hs = [lm.layers[b].self_attn.register_forward_pre_hook(pre, with_kwargs=True) for b in layers]
+    hs = [lm.layers[b].self_attn.register_forward_pre_hook(partial(pre, block_mask=masks[b]), with_kwargs=True)
+          for b in layers]
     try:
         yield
     finally:
@@ -120,10 +145,10 @@ def knockout(lm, layers, block_mask, pad_mask):
 @torch.no_grad()
 def scores(lm, seqs, layers=(), block_mask=None):
     if not layers:
-        return pair_margins(lm.token_logprobs(seqs))
+        return pair_scores(lm.token_logprobs(seqs))
     _, pad = lm._collate(seqs)
     with knockout(lm, layers, block_mask, pad):
-        return pair_margins(lm.token_logprobs(seqs))
+        return pair_scores(lm.token_logprobs(seqs))
 
 
 def run_block(lm, items, b, width, bs, variants):
@@ -140,9 +165,18 @@ def run_block(lm, items, b, width, bs, variants):
             bm = blocked(items, idx, k, q, T, lm.device)
             for w in [w for w, k2, q2 in variants if (k2, q2) == (k, q)]:
                 res[f"{w}/{k}/{q}"].append(scores(lm, seqs, windows[w], bm))
-    return {key: {name: torch.cat([p[j] for p in parts]).cpu().numpy().tolist()
-                  for j, name in enumerate(["mean", "first", "rest"])}
-            for key, parts in res.items()}
+    out = {}
+    for key, parts in res.items():
+        missing = []
+        if key != "biased":
+            _, k, q = key.split("/")
+            missing = [i for i, it in enumerate(items) if not item_has_variant(it, k, q)]
+        out[key] = {}
+        for j, name in enumerate(PARTS):
+            v = torch.cat([p[j] for p in parts]).cpu().numpy()
+            v[missing] = np.nan
+            out[key][name] = v.tolist()
+    return out
 
 
 def main():
@@ -153,6 +187,8 @@ def main():
     ap.add_argument("--chunk", default=None)
     ap.add_argument("--condition", default="assert_plausible", help="prompt condition with an inserted answer")
     ap.add_argument("--routes", action="store_true", help="tag vs. gate variants (see docstring)")
+    ap.add_argument("--keys", nargs="+", default=KEYS, choices=KEYS, help="keys of the standard variants")
+    ap.add_argument("--tag", default=None, help="output folder suffix: knockout/<condition>__<tag>/")
     ap.add_argument("--window", type=int, default=4, help="width of the `win` knockout window")
     ap.add_argument("--limit", type=int, default=None, help="first N neutral-correct items only")
     ap.add_argument("--bs", type=int, default=16, help="items per batch (2 sequences each)")
@@ -173,8 +209,11 @@ def main():
     else:
         out_dir = run_dir(root, "knockout", args.condition, LEGACY_TAG)
         # content-free conditions have no answer tokens (and framing == span)
-        variants = [(w, k, q) for w in WINDOWS for k in KEYS for q in QUERIES
+        variants = [(w, k, q) for w in WINDOWS for k in args.keys for q in QUERIES
                     if variant_possible(items, k, q)]
+    if args.tag:
+        out_dir = root / "knockout" / f"{args.condition}{'__routes' if args.routes else ''}__{args.tag}"
+
     keys = list(dict.fromkeys(k for _, k, _ in variants))
     out_dir.mkdir(parents=True, exist_ok=True)
     blocks = chunk(parse_blocks(args.blocks, lm.n_layers), args.chunk)
@@ -183,7 +222,8 @@ def main():
     common = {"model": args.model, "condition": args.condition, "rows": rows, "window": args.window,
               "keys": keys, "variants": [list(v) for v in variants],
               **{f"m_neutral{s}": neu[p][rows].tolist() for p, s in sfx},
-              **{f"m_biased_behavior{s}": bia[p][rows].tolist() for p, s in sfx}}
+              **{f"m_biased_behavior{s}": bia[p][rows].tolist() for p, s in sfx},
+              **first_token_lps(nc, rows, "neutral", "m_neutral")}
     mn = np.array(common["m_neutral_first"])
     for b in blocks:
         f = out_dir / f"block{b:02d}.json"
@@ -192,7 +232,7 @@ def main():
         res = run_block(lm, items, b, args.window, args.bs, variants)
         write_json(f, {**common, "block": b, "margins": res})
         mb = np.array(res["biased"]["first"])
-        msg = [f"{w}/{k}/{q}={np.mean(np.array(res[f'{w}/{k}/{q}']['first']) - mb) / np.mean(mn - mb):+.2f}"
+        msg = [f"{w}/{k}/{q}={np.nanmean(np.array(res[f'{w}/{k}/{q}']['first']) - mb) / np.mean(mn - mb):+.2f}"
                for w, k, q in variants if q != "after" or args.routes]
         print(f"block {b:2d} (first token, eliminated): " + "  ".join(msg))
 

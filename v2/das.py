@@ -65,6 +65,17 @@ def pair_margins(lps: list[torch.Tensor]):
     return mean[0::2] - mean[1::2], first[0::2] - first[1::2], rest[0::2] - rest[1::2]
 
 
+PARTS = ["mean", "first", "rest", "first_plus", "first_minus"]
+
+
+def pair_scores(lps: list[torch.Tensor]):
+    """pair_margins plus the first-token log-probs of c_plus and c_minus themselves, so that a
+    margin change can be split into a drop of the correct and a rise of the wrong answer.
+    Order as in PARTS."""
+    first = torch.stack([lp[0] for lp in lps])
+    return (*pair_margins(lps), first[0::2], first[1::2])
+
+
 def _src(src_layer: np.ndarray, idx, device):
     """src_layer: one block's source vectors for all items, [n_items, d] (preloaded)."""
     return torch.from_numpy(np.ascontiguousarray(src_layer[np.asarray(idx)], dtype=np.float32)).to(device)

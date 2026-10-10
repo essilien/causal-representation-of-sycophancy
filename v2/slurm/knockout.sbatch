@@ -1,7 +1,8 @@
 #!/bin/bash
 # Attention knockout from the assertion tokens (v2/run_knockout.py). No training; needs
 # only the behavior stage. Array task = block chunk. Optional: COND (default
-# assert_plausible); ROUTES=1 runs the tag-vs-gate variants. Submit from the repository root:
+# assert_plausible); ROUTES=1 runs the tag-vs-gate variants; KEYS (e.g. "span") restricts the
+# standard variants and TAG names the output folder (knockout/<COND>__<TAG>). Submit from the repository root:
 #   sbatch --mail-user="$SYCO_MAIL" --export=ALL,MODEL=llama v2/slurm/knockout.sbatch
 #SBATCH --job-name=syco-knockout
 #SBATCH --partition=gpu_a100_il
@@ -14,4 +15,5 @@
 #SBATCH --mail-type=END,FAIL   # recipient: --mail-user (SYCO_MAIL)
 source v2/slurm/env.sh
 python -m v2.run_knockout --model "$MODEL" --results-root "$SYCO_RESULTS" \
-    --blocks all --chunk "$SLURM_ARRAY_TASK_ID/4" --condition "${COND:-assert_plausible}" ${ROUTES:+--routes}
+    --blocks all --chunk "$SLURM_ARRAY_TASK_ID/4" --condition "${COND:-assert_plausible}" ${ROUTES:+--routes} \
+    ${KEYS:+--keys $KEYS} ${TAG:+--tag "$TAG"}
