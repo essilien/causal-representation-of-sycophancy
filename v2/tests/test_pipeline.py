@@ -277,6 +277,13 @@ def test_position_experiments(lm):
     assert all(torch.allclose(u, v, atol=1e-5, equal_nan=True) for u, v in zip(a1, a2)), "per-head mask"
     a3 = scores(lm, seqs, [1], {1: head_mask(its, [0, 1, 2], [0], nh, T, lm.device)})
     assert not torch.allclose(a3[1], scores(lm, seqs)[1], atol=1e-6), "one-head knockout had no effect"
+    # a group can be empty for every item of a batch (here bs=1 and one item without `pre`):
+    # that item gets NaN, the others are traced as usual
+    import copy
+    its2 = copy.deepcopy(items)
+    its2[1].pos["pre"] = []
+    res = run_block(lm, its2, 1, ["pre"], scale=5.0, seed=0, bs=1)
+    assert np.isnan(res["restore/pre"]["first"][1]) and np.isfinite(res["restore/pre"]["first"][0])
     print("position-experiment tests passed")
 
 

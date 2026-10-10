@@ -681,7 +681,7 @@ def analyze_knockout(root: Path, out: Path):
         all_rows[cfg] = rows
         w = next(iter(runs.values()))[0]["window"]
         sfx = "" if cfg == LEGACY_TAG else f"__{cfg}"
-        if cfg.endswith("__routes"):  # every variant, labelled key <- query
+        if "__routes" in cfg:  # every variant, labelled key <- query
             panel = lambda win: [(f"{a}_{k}_{q}", f"{q} -/-> {k}") for a, k, q in variants if a == win]
         else:
             panel = lambda win: [(f"{win}_{k}_after", k) for k in keys if (win, k, "after") in variants]

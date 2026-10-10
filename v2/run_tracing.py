@@ -115,8 +115,10 @@ def pair_index(items, idx, group, where, device):
             rows += [2 * r, 2 * r + 1]
             cols += [p, p]
             sel += [where[(r, p)]] * 2
-    return (torch.tensor(rows, device=device), torch.tensor(cols, device=device),
-            torch.tensor(sel, device=device))
+    # explicit dtype: a group can be empty for every item of a batch (e.g. no token after the
+    # answer when "." merges with it), and torch.tensor([]) would be float
+    return (torch.tensor(rows, dtype=torch.long, device=device), torch.tensor(cols, dtype=torch.long, device=device),
+            torch.tensor(sel, dtype=torch.long, device=device))
 
 
 def run_block(lm, items, b, groups, scale, seed, bs, corruption="noise"):
@@ -145,7 +147,7 @@ def run_block(lm, items, b, groups, scale, seed, bs, corruption="noise"):
                 where[(r, p)] = len(rec_rows)
                 rec_rows.append(r)
                 rec_cols.append(p)
-        rr, rc = torch.tensor(rec_rows, device=dev), torch.tensor(rec_cols, device=dev)
+        rr, rc = torch.tensor(rec_rows, dtype=torch.long, device=dev), torch.tensor(rec_cols, dtype=torch.long, device=dev)
         states = {"clean": record(lm, prefixes, b, rr, rc, (None, None, None)),
                   "corr": record(lm, corr_prefixes, b, rr, rc, prompt_noise)}
         with torch.no_grad():

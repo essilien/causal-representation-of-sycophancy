@@ -84,9 +84,10 @@ def item_has_variant(it, key, query):
     return bool(k) and bool(qs) and min(k) < max(qs)
 
 
-def variant_possible(items, key, query, min_frac=0.9):
+def variant_possible(items, key, query, min_frac=0.8):
     """The variant exists for at least `min_frac` of the items (e.g. assert_end has no
-    `post` group when the final "." merges with the answer's last token). Items without it
+    `post` group for 10-14% of the items, when the final "." merges with the answer's last
+    token, e.g. ").": 0.8 keeps that variant). Items without it
     get NaN margins for that variant (see run_block)."""
     return np.mean([item_has_variant(it, key, query) for it in items]) >= min_frac
 
