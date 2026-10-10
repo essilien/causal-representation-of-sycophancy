@@ -903,15 +903,18 @@ def main():
     ap.add_argument("--results-root", required=True)
     ap.add_argument("--only", nargs="+", default=["behavior", "groups", "probe", "main", "rank", "transfer", "illusion",
                              "tracing", "knockout", "answer_direction", "answer_patch"])
-    ap.add_argument("--group", choices=["all", "flip", "noflip"], default="all",
-                    help="restrict per-item analyses to items that do / do not flip under the main assertion "
-                         "(outputs go to analysis__<group>/)")
+    ap.add_argument("--group", choices=["all", "flip", "noflip", "conf_low", "conf_high"], default="all",
+                    help="restrict per-item analyses to items that do / do not flip under the main assertion, "
+                         "or to the lower / upper half of the neutral margin (prior confidence; unlike the "
+                         "flip split, not selected on the outcome). Outputs go to analysis__<group>/")
     args = ap.parse_args()
     root = Path(args.results_root) / args.model
     out = root / "analysis"
     if args.group != "all":
-        _, flip = _flip_labels(root)
-        GROUP = flip if args.group == "flip" else ~flip
+        nc, flip = _flip_labels(root)
+        neu = np.array([it["margin"]["neutral"] for it in nc])
+        GROUP = {"flip": flip, "noflip": ~flip, "conf_low": neu <= np.median(neu),
+                 "conf_high": neu > np.median(neu)}[args.group]
         out = root / f"analysis__{args.group}"
         # item-level parts only; behavior-level summaries are not subgroup-specific
         args.only = [p for p in args.only if p not in ("behavior", "groups", "probe", "transfer", "answer_direction")]

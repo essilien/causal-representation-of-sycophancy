@@ -10,6 +10,9 @@ fig_read_depth.pdf : where the inserted answer is read (attention knockout from 
                      wrong answer, a mere mention of it, and an asserted irrelevant answer
 fig_das_necessity.pdf : DAS (k=64) and full patching at the last prompt token, inserted into
                      the neutral run (sufficiency) vs. removed from the biased run (necessity)
+fig_last_token.pdf : every last-token curve in one place: DAS inserted / removed, full
+                     patching and its item-specific part, and the item-specific part of the
+                     per-item answer-direction intervention (needs answer_patch.csv)
 """
 import argparse
 import csv
@@ -68,17 +71,49 @@ def fig_read_depth(dirs, out):
         for cond, label, color, ls in CONDITIONS:
             series(ax_ko, rows(dirs[m] / "knockout.csv", config=cond), "from_span_after_first", color, ls, label)
             tr = rows(dirs[m] / "tracing.csv", config=f"{cond}__noise")
-            if tr:
+            # noise removes only ~35% of this condition's shift in Llama, so its tracing curve
+            # is not interpretable there (stated in the caption)
+            if tr and not (m == "llama" and cond == "mention_plausible_1"):
                 series(ax_tr, tr, "restore_last_first", color, ls, label)
         style(ax_ko, f"{name}: knockout from $b$ on", "Fraction of first-token shift" if j == 0 else None)
         style(ax_tr, f"{name}: restore last token")
     for ax in axes:
-        ax.set_ylim(-0.6, 1.15)
+        ax.set_ylim(-0.1, 1.12)
     h, l = axes[0].get_legend_handles_labels()
     fig.legend(h, l, loc="upper center", ncol=3, frameon=False, handlelength=2.4, bbox_to_anchor=(0.5, 1.0))
     fig.tight_layout(pad=0.3, w_pad=0.6, rect=(0, 0, 1, 0.9))
     fig.savefig(out / "fig_read_depth.pdf", bbox_inches="tight", pad_inches=0.02)
     fig.savefig(out / "fig_read_depth.png", dpi=250, bbox_inches="tight", pad_inches=0.02)
+    plt.close(fig)
+
+
+def line(ax, x, y, color, ls, label):
+    ax.plot(x, y, color=color, ls=ls, lw=1.3, label=label)
+
+
+def fig_last_token(dirs, out):
+    """Item-specific parts = matched source minus another item's neutral source (the part
+    of an intervention that depends on the item; full patching also disrupts generically)."""
+    fig, axes = plt.subplots(1, 2, figsize=(3.1, 2.25), sharey=True)
+    for ax, (m, name) in zip(axes, MODELS):
+        fw, rv, ap = dirs[m] / "illusion.csv", dirs[m] / "illusion_reverse.csv", dirs[m] / "answer_patch.csv"
+        series(ax, rows(fw, method="das"), "matched_first", BLUE, "-", "DAS insert")
+        series(ax, rows(rv, method="das"), "matched_first", BLUE, "--", "DAS remove")
+        pr = rows(fw, method="patch")
+        x = [int(r["block"]) for r in pr]
+        line(ax, x, [float(r["matched_first"]) for r in pr], ORANGE, "-", "full patching")
+        line(ax, x, [float(r["matched_first"]) - float(r["other_neutral_first"]) for r in pr],
+             ORANGE, ":", "full patching, item-specific")
+        a = rows(ap)
+        line(ax, [int(r["block"]) for r in a], [float(r["dir2"]) - float(r["dir2_on"]) for r in a],
+             AQUA, "-", "own answer direction, item-specific")
+        style(ax, name, "Frac. of first-token shift" if ax is axes[0] else None)
+        ax.set_ylim(-0.15, 1.08)
+    h, l = axes[0].get_legend_handles_labels()
+    fig.legend(h, l, loc="upper center", ncol=2, frameon=False, handlelength=2.2, bbox_to_anchor=(0.5, 1.0))
+    fig.tight_layout(pad=0.3, w_pad=0.5, rect=(0, 0, 1, 0.72))
+    fig.savefig(out / "fig_last_token.pdf", bbox_inches="tight", pad_inches=0.02)
+    fig.savefig(out / "fig_last_token.png", dpi=250, bbox_inches="tight", pad_inches=0.02)
     plt.close(fig)
 
 
@@ -110,6 +145,8 @@ def main():
     dirs = {"llama": a.llama, "qwen": a.qwen}
     fig_read_depth(dirs, a.out)
     fig_das_necessity(dirs, a.out)
+    if (a.llama / "answer_patch.csv").exists() and (a.qwen / "answer_patch.csv").exists():
+        fig_last_token(dirs, a.out)
     print(f"wrote figures to {a.out}")
 
 
