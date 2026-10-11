@@ -5,9 +5,11 @@ Figures for the SRW paper, built from the `analysis/` CSVs of both models (run
     python -m v2.paper_figures --llama results_llama/analysis --qwen results_qwen/analysis \
         --out <paper>/latex/figures
 
-fig_read_depth.pdf : where the inserted answer is read (attention knockout from block b on,
-                     and restoring the last prompt token in noise tracing), for an asserted
-                     wrong answer, a mere mention of it, and an asserted irrelevant answer
+fig_read_depth.pdf : where the inserted answer is read (attention knockout from block b on)
+                     for an asserted wrong answer, a mere mention of it, and an asserted
+                     irrelevant answer; and, with --raw, the same knockout for the assertion split
+                     into the drop of c_plus and the rise of c_minus (first token; items whose
+                     candidates differ in it), from knockout/assert_plausible__cand
 fig_das_necessity.pdf : DAS (k=64) and full patching at the last prompt token, inserted into
                      the neutral run (sufficiency) vs. removed from the biased run (necessity)
 fig_last_token.pdf : every last-token curve in one place: DAS inserted / removed, full
@@ -16,7 +18,10 @@ fig_last_token.pdf : every last-token curve in one place: DAS inserted / removed
 """
 import argparse
 import csv
+import json
 from pathlib import Path
+
+import numpy as np
 
 import matplotlib
 
@@ -64,23 +69,51 @@ def style(ax, title, ylabel=None):
         ax.set_ylabel(ylabel)
 
 
-def fig_read_depth(dirs, out):
+def candidate_rows(run_dir, variant="from/span/after", n_boot=2000, seed=0):
+    """Per block: fraction of the drop of c_plus and of the rise of c_minus (first token)
+    eliminated by the knockout, with 95% item-bootstrap intervals, on the items whose
+    candidates differ in their first token (otherwise both parts are the same number)."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for f in sorted(Path(run_dir).glob("block*.json")):
+        d = json.loads(f.read_text())
+        np_, nm = np.array(d["m_neutral_first_plus"]), np.array(d["m_neutral_first_minus"])
+        bp, bm = (np.array(d["margins"]["biased"][k]) for k in ("first_plus", "first_minus"))
+        kp, km = (np.array(d["margins"][variant][k]) for k in ("first_plus", "first_minus"))
+        keep = np_ != nm
+        row = {"block": d["block"]}
+        for name, (ko, base, ref) in {"plus": (kp, bp, np_), "minus": (km, bm, nm)}.items():
+            a, b = (ko - base)[keep], (ref - base)[keep]
+            idx = rng.integers(0, len(a), (n_boot, len(a)))
+            bs = a[idx].mean(1) / b[idx].mean(1)
+            row[name], row[name + "_lo"], row[name + "_hi"] = a.mean() / b.mean(), *np.percentile(bs, [2.5, 97.5])
+        out.append(row)
+    return sorted(out, key=lambda r: r["block"])
+
+
+def fig_read_depth(dirs, out, raw=None):
     fig, axes = plt.subplots(1, 4, figsize=(6.3, 2.0), sharey=True)
     for j, (m, name) in enumerate(MODELS):
-        ax_ko, ax_tr = axes[j], axes[2 + j]
+        ax_ko = axes[j]
         for cond, label, color, ls in CONDITIONS:
             series(ax_ko, rows(dirs[m] / "knockout.csv", config=cond), "from_span_after_first", color, ls, label)
-            tr = rows(dirs[m] / "tracing.csv", config=f"{cond}__noise")
-            # noise removes only ~35% of this condition's shift in Llama, so its tracing curve
-            # is not interpretable there (stated in the caption)
-            if tr and not (m == "llama" and cond == "mention_plausible_1"):
-                series(ax_tr, tr, "restore_last_first", color, ls, label)
-        style(ax_ko, f"{name}: knockout from $b$ on", "Fraction of first-token shift" if j == 0 else None)
-        style(ax_tr, f"{name}: restore last token")
+        style(ax_ko, f"{name}: knockout from $b$ on", "Fraction eliminated" if j == 0 else None)
+        if raw is not None:
+            ax = axes[2 + j]
+            cr = candidate_rows(raw / m / "knockout" / "assert_plausible__cand")
+            for part, label, color, ls in [("plus", "assert $c_-$: drop of $s(c_+)$", AQUA, "-."),
+                                           ("minus", "assert $c_-$: rise of $s(c_-)$", INK, "-")]:
+                rs = [{"block": r["block"], "v": r[part], "v_lo": r[part + "_lo"], "v_hi": r[part + "_hi"]} for r in cr]
+                series(ax, rs, "v", color, ls, label)
+            style(ax, f"{name}: split by candidate")
     for ax in axes:
-        ax.set_ylim(-0.1, 1.12)
-    h, l = axes[0].get_legend_handles_labels()
-    fig.legend(h, l, loc="upper center", ncol=3, frameon=False, handlelength=2.4, bbox_to_anchor=(0.5, 1.0))
+        ax.set_ylim(-0.45, 1.15)
+    h, l = [], []
+    for ax in axes[[0, 2] if raw is not None else [0]]:
+        hh, ll = ax.get_legend_handles_labels()
+        h, l = h + hh, l + ll
+    fig.legend(h, l, loc="upper center", ncol=5, frameon=False, handlelength=2.4, bbox_to_anchor=(0.5, 1.0),
+               columnspacing=1.2)
     fig.tight_layout(pad=0.3, w_pad=0.6, rect=(0, 0, 1, 0.9))
     fig.savefig(out / "fig_read_depth.pdf", bbox_inches="tight", pad_inches=0.02)
     fig.savefig(out / "fig_read_depth.png", dpi=250, bbox_inches="tight", pad_inches=0.02)
@@ -140,10 +173,11 @@ def main():
     ap.add_argument("--llama", required=True, type=Path)
     ap.add_argument("--qwen", required=True, type=Path)
     ap.add_argument("--out", required=True, type=Path)
+    ap.add_argument("--raw", type=Path, default=None, help="results root with <model>/knockout/assert_plausible__cand")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     dirs = {"llama": a.llama, "qwen": a.qwen}
-    fig_read_depth(dirs, a.out)
+    fig_read_depth(dirs, a.out, a.raw)
     fig_das_necessity(dirs, a.out)
     if (a.llama / "answer_patch.csv").exists() and (a.qwen / "answer_patch.csv").exists():
         fig_last_token(dirs, a.out)
